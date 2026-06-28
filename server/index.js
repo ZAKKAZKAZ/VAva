@@ -85,6 +85,26 @@ io.on('connection', (socket) => {
     }
     socket.to(currentRoom).emit('world-transformed', data);
   });
+  // テキストチャットの仲介
+  socket.on('chat-msg', (text) => {
+    if (!currentRoom) return;
+    const roomPlayers = getRoom(currentRoom);
+    const player = roomPlayers.get(id);
+    const name = player ? player.name : id.substring(0, 8);
+    socket.to(currentRoom).emit('chat-msg', { id, name, text });
+  });
+
+  // WebRTC ボイスチャット用シグナリングの仲介
+  socket.on('webrtc-offer', ({ to, offer }) => {
+    io.to(to).emit('webrtc-offer', { from: id, offer });
+  });
+  socket.on('webrtc-answer', ({ to, answer }) => {
+    io.to(to).emit('webrtc-answer', { from: id, answer });
+  });
+  socket.on('webrtc-candidate', ({ to, candidate }) => {
+    io.to(to).emit('webrtc-candidate', { from: id, candidate });
+  });
+
   socket.on('state', (data) => {
     if (!currentRoom) return;
     const roomPlayers = getRoom(currentRoom);

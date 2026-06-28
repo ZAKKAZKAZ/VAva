@@ -81,6 +81,16 @@ const remotePlayers = new Map<string, RemotePlayerObj>();
 let localPlayerName = 'Player_' + Math.floor(Math.random() * 9000 + 1000);
 let localRoomName = 'CHAT';
 let localAvatarCache: { fileName: string; type: 'vrm' | 'fbx'; buffer: ArrayBuffer } | null = null;
+
+// WebRTC & Chat Globals
+interface PeerConnectionInfo {
+  pc: RTCPeerConnection;
+  audio?: HTMLAudioElement;
+}
+const peerConnections = new Map<string, PeerConnectionInfo>();
+let localStream: MediaStream | null = null;
+let isMicActive = false;
+
 let lastNetworkSend = 0;
 const SEND_INTERVAL = 1000 / 20; // 20fps
 const PLAYER_COLORS = [
@@ -427,6 +437,39 @@ function init() {
     };
     mobileJumpBtn.addEventListener('touchstart', triggerJump, { passive: false });
     mobileJumpBtn.addEventListener('mousedown', triggerJump);
+  }
+
+  // --- Text Chat UI Wiring ---
+  const chatInput = document.getElementById('chat-input') as HTMLInputElement;
+  const chatSendBtn = document.getElementById('chat-send-btn') as HTMLButtonElement;
+
+  function sendChatMessage() {
+    if (!chatInput) return;
+    const text = chatInput.value.trim();
+    if (!text) return;
+
+    if (socket && socket.connected) {
+      socket.emit('chat-msg', text);
+      appendChatMessage('自分', text);
+    } else {
+      appendChatMessage('システム', '⚠️ サーバーに接続されていません。', true);
+    }
+    chatInput.value = '';
+  }
+
+  if (chatSendBtn && chatInput) {
+    chatSendBtn.addEventListener('click', sendChatMessage);
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        sendChatMessage();
+      }
+    });
+  }
+
+  // --- Voice Chat UI Wiring ---
+  const micBtn = document.getElementById('mic-btn') as HTMLButtonElement;
+  if (micBtn) {
+    micBtn.addEventListener('click', toggleMic);
   }
 }
 
@@ -1242,14 +1285,30 @@ function initNetwork() {
     if (worldTransform) {
       applyWorldTransform(worldTransform);
     }
-  });
 
+    // Show chat area and mic button
+    const chatContainer = document.getElementById('chat-container');
+    const micBtn = document.getElementById('mic-btn');
+    if (chatContainer) chatContainer.style.display = 'flex';
+    if (micBtn) micBtn.style.display = 'block';
+    appendChatMessage('システム', `🟢 ルーム [${room}] に接続しました。`, true);
+  });
+ 
   socket.on('disconnect', () => {
     console.log('[Network] Disconnected');
     updateNetworkStatus(false);
     remotePlayers.forEach((_, id) => removeRemotePlayer(id));
-  });
 
+    // Hide chat area and mic button
+    const chatContainer = document.getElementById('chat-container');
+    const micBtn = document.getElementById('mic-btn');
+    if (chatContainer) chatContainer.style.display = 'none';
+    if (micBtn) micBtn.style.display = 'none';
+
+    stopLocalStream();
+    peerConnections.forEach((_, pid) => closePeerConnection(pid));
+  });
+ 
   // 既存プレイヤー一覧を受信
   socket.on('init', (players: Array<{ id: string } & RemotePlayerState>) => {
     players.forEach(({ id, ...state }) => {
@@ -1257,16 +1316,25 @@ function initNetwork() {
         remotePlayers.set(id, createRemotePlayerMesh(id, state.name));
       }
       applyRemotePlayerState(remotePlayers.get(id)!, state);
+
+      // Establish WebRTC connection with existing players
+      initiateWebRTCPeer(id);
+      sendWebRTCOffer(id);
     });
   });
-
+ 
   // 新規参加
   socket.on('player-joined', ({ id }: { id: string }) => {
     if (!remotePlayers.has(id)) {
       remotePlayers.set(id, createRemotePlayerMesh(id, id.substring(0, 8)));
     }
-  });
+    // Setup WebRTC and send offer to new player
+    initiateWebRTCPeer(id);
+    sendWebRTCOffer(id);
 
+    appendChatMessage('システム', `📢 プレイヤー ${id.substring(0, 8)} が入室しました。`, true);
+  });
+ 
   // 状態更新
   socket.on('player-state', ({ id, ...state }: { id: string } & RemotePlayerState) => {
     if (!remotePlayers.has(id)) {
@@ -1294,6 +1362,53 @@ function initNetwork() {
   socket.on('world-transformed', (data: { x: number, y: number, z: number, rY: number, s: number }) => {
     applyWorldTransform(data);
   });
+
+  // チャットメッセージを受信
+  socket.on('chat-msg', ({ name, text }: { id: string; name: string; text: string }) => {
+    appendChatMessage(name, text);
+  });
+
+  // WebRTC シグナリングハンドリング
+  socket.on('webrtc-offer', async ({ from, offer }: { from: string; offer: any }) => {
+    console.log(`[WebRTC] Received offer from ${from}`);
+    let pci = peerConnections.get(from);
+    if (!pci) {
+      initiateWebRTCPeer(from);
+      pci = peerConnections.get(from)!;
+    }
+
+    try {
+      await pci.pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pci.pc.createAnswer();
+      await pci.pc.setLocalDescription(answer);
+      socket!.emit('webrtc-answer', { to: from, answer });
+    } catch (err) {
+      console.error('Answerの作成に失敗しました:', err);
+    }
+  });
+
+  socket.on('webrtc-answer', async ({ from, answer }: { from: string; answer: any }) => {
+    console.log(`[WebRTC] Received answer from ${from}`);
+    const pci = peerConnections.get(from);
+    if (pci) {
+      try {
+        await pci.pc.setRemoteDescription(new RTCSessionDescription(answer));
+      } catch (err) {
+        console.error('Answerの適用に失敗しました:', err);
+      }
+    }
+  });
+
+  socket.on('webrtc-candidate', async ({ from, candidate }: { from: string; candidate: any }) => {
+    const pci = peerConnections.get(from);
+    if (pci) {
+      try {
+        await pci.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.error('ICE Candidateの追加に失敗しました:', err);
+      }
+    }
+  });
 }
 
 function disconnectNetwork() {
@@ -1303,6 +1418,23 @@ function disconnectNetwork() {
   }
   remotePlayers.forEach((_, id) => removeRemotePlayer(id));
   updateNetworkStatus(false);
+
+  // Hide chat and mic buttons
+  const chatContainer = document.getElementById('chat-container');
+  const micBtn = document.getElementById('mic-btn');
+  if (chatContainer) chatContainer.style.display = 'none';
+  if (micBtn) {
+    micBtn.style.display = 'none';
+    micBtn.textContent = '🎤 マイク: OFF';
+    micBtn.style.background = 'rgba(255, 108, 142, 0.1)';
+    micBtn.style.color = '#ff6c8e';
+    micBtn.style.borderColor = 'rgba(255, 108, 142, 0.25)';
+  }
+  isMicActive = false;
+
+  // Stop WebRTC audio and close connections
+  stopLocalStream();
+  peerConnections.forEach((_, id) => closePeerConnection(id));
 }
 
 function updateNetworkStatus(connected: boolean, room?: string, count?: number) {
@@ -1758,6 +1890,165 @@ function handleSkyboxUpload(event: Event) {
       URL.revokeObjectURL(url);
     }
   );
+}
+
+// --- Text & Voice Chat Helpers ---
+function appendChatMessage(senderName: string, text: string, isSystem = false) {
+  const chatMessages = document.getElementById('chat-messages');
+  if (!chatMessages) return;
+
+  const item = document.createElement('div');
+  item.className = 'chat-message-item' + (isSystem ? ' system' : '');
+  
+  if (isSystem) {
+    item.textContent = text;
+  } else {
+    const senderSpan = document.createElement('span');
+    senderSpan.className = 'sender';
+    senderSpan.textContent = senderName + ': ';
+    item.appendChild(senderSpan);
+    
+    const textNode = document.createTextNode(text);
+    item.appendChild(textNode);
+  }
+  
+  chatMessages.appendChild(item);
+  chatMessages.scrollTop = chatMessages.scrollHeight; // Auto scroll
+}
+
+async function toggleMic() {
+  const micBtn = document.getElementById('mic-btn') as HTMLButtonElement;
+  if (!micBtn) return;
+
+  if (isMicActive) {
+    // マイクOFF
+    stopLocalStream();
+    isMicActive = false;
+    micBtn.textContent = '🎤 マイク: OFF';
+    micBtn.style.background = 'rgba(255, 108, 142, 0.1)';
+    micBtn.style.color = '#ff6c8e';
+    micBtn.style.borderColor = 'rgba(255, 108, 142, 0.25)';
+    appendChatMessage('システム', '🎤 マイクをミュートしました。', true);
+  } else {
+    // マイクON
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      isMicActive = true;
+      micBtn.textContent = '🎤 マイク: ON';
+      micBtn.style.background = 'rgba(108, 255, 180, 0.15)';
+      micBtn.style.color = '#6cffb4';
+      micBtn.style.borderColor = 'rgba(108, 255, 180, 0.3)';
+      appendChatMessage('システム', '🎤 マイクの使用を開始しました。', true);
+
+      // すでにルームにいるメンバーとの接続にトラックを追加
+      remotePlayers.forEach((_, targetId) => {
+        let pci = peerConnections.get(targetId);
+        if (!pci) {
+          initiateWebRTCPeer(targetId);
+          pci = peerConnections.get(targetId)!;
+        }
+        
+        // 既存のセンダーがないかチェックしてトラック追加
+        const currentTracks = pci.pc.getSenders().map(s => s.track);
+        localStream!.getTracks().forEach((track) => {
+          if (!currentTracks.includes(track)) {
+            pci!.pc.addTrack(track, localStream!);
+          }
+        });
+
+        // Offerを投げる
+        sendWebRTCOffer(targetId);
+      });
+
+    } catch (err) {
+      console.error('[WebRTC] マイク取得エラー:', err);
+      appendChatMessage('システム', '⚠️ マイクの取得に失敗しました。パーミッションを確認してください。', true);
+    }
+  }
+}
+
+function stopLocalStream() {
+  if (localStream) {
+    localStream.getTracks().forEach(track => track.stop());
+    localStream = null;
+  }
+  // 全PeerConnectionからトラックを取り除く
+  peerConnections.forEach((pci) => {
+    pci.pc.getSenders().forEach((sender) => {
+      pci.pc.removeTrack(sender);
+    });
+  });
+}
+
+const rtcConfig: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19002' },
+    { urls: 'stun:stun1.l.google.com:19002' },
+    { urls: 'stun:stun2.l.google.com:19002' }
+  ],
+};
+
+function initiateWebRTCPeer(targetId: string) {
+  if (peerConnections.has(targetId)) return peerConnections.get(targetId)!.pc;
+
+  const pc = new RTCPeerConnection(rtcConfig);
+  const pci: PeerConnectionInfo = { pc };
+  peerConnections.set(targetId, pci);
+
+  // ローカルマイクがONならトラックを登録
+  if (localStream) {
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream!));
+  }
+
+  // ICE Candidateの送信
+  pc.onicecandidate = (event) => {
+    if (event.candidate && socket && socket.connected) {
+      socket.emit('webrtc-candidate', { to: targetId, candidate: event.candidate });
+    }
+  };
+
+  // 相手の音声トラックの受信
+  pc.ontrack = (event) => {
+    console.log(`[WebRTC] Received remote audio track from ${targetId}`);
+    if (!pci.audio) {
+      const audio = document.createElement('audio');
+      audio.srcObject = event.streams[0];
+      audio.autoplay = true;
+      audio.style.display = 'none';
+      document.body.appendChild(audio);
+      pci.audio = audio;
+    }
+  };
+
+  return pc;
+}
+
+async function sendWebRTCOffer(targetId: string) {
+  const pci = peerConnections.get(targetId);
+  if (!pci) return;
+
+  try {
+    const offer = await pci.pc.createOffer();
+    await pci.pc.setLocalDescription(offer);
+    if (socket && socket.connected) {
+      socket.emit('webrtc-offer', { to: targetId, offer });
+    }
+  } catch (err) {
+    console.error('[WebRTC] Offer作成エラー:', err);
+  }
+}
+
+function closePeerConnection(targetId: string) {
+  const pci = peerConnections.get(targetId);
+  if (pci) {
+    pci.pc.close();
+    if (pci.audio) {
+      pci.audio.pause();
+      pci.audio.remove();
+    }
+    peerConnections.delete(targetId);
+    console.log(`[WebRTC] Closed connection with ${targetId}`);
+  }
 }
 
 
