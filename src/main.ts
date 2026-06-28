@@ -1,0 +1,1480 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { VRMLoaderPlugin, VRM } from '@pixiv/three-vrm';
+import { io, Socket } from 'socket.io-client';
+
+// MediaPipe & Kalidokit (Loaded via CDN in index.html)
+declare const FaceMesh: any;
+declare const Camera: any;
+declare const Kalidokit: any;
+
+// --- Global Variables ---
+let scene: THREE.Scene;
+let camera: THREE.PerspectiveCamera;
+let renderer: THREE.WebGLRenderer;
+let controls: OrbitControls;
+interface LoadedAvatar {
+  id: string;
+  name: string;
+  type: 'vrm' | 'fbx';
+  vrm?: VRM;
+  fbx?: THREE.Group;
+  initialX: number;
+}
+const loadedAvatars: LoadedAvatar[] = [];
+let activeAvatarIndex = 0;
+
+let currentVrm: VRM | undefined;
+let currentFbx: THREE.Group | undefined;
+let currentWorld: THREE.Group | undefined;
+let defaultWorldGroup: THREE.Group;
+let mainLight: THREE.DirectionalLight;
+let sunSphere: THREE.Mesh;
+let skyboxTexture: THREE.Texture | undefined;
+let sunTimeAngle = 45; // Sun position angle (0 to 360 degrees)
+let sunSpeedFactor = 1.0; // Time progression speed multiplier
+let isCustomSunColor = false;
+const customSunColor = new THREE.Color('#ffffff');
+let fbxMixer: THREE.AnimationMixer | undefined;
+const clock = new THREE.Clock();
+
+// Tracking Targets
+const lookAtTarget = new THREE.Object3D();
+let isCameraTracking = false;
+
+// Physics / Movement
+const keys = { w: false, a: false, s: false, d: false };
+let jumpVelocity = 0;
+let isJumping = false;
+
+// Procedural Animation State
+let walkTime = 0;
+let currentAnimState = 'idle'; // idle, walk, walkBack, strafeLeft, strafeRight, jump
+
+// --- Multiplayer Network ---
+interface RemotePlayerState {
+  name: string;
+  position: { x: number; y: number; z: number };
+  rotationY: number;
+  boneRots: Record<string, { x: number; y: number; z: number }>;
+}
+interface RemotePlayerObj {
+  group: THREE.Group;
+  head: THREE.Mesh;
+  targetPos: THREE.Vector3;
+  targetRotY: number;
+  nameSprite: THREE.Sprite;
+}
+let socket: Socket | null = null;
+const remotePlayers = new Map<string, RemotePlayerObj>();
+let localPlayerName = 'Player_' + Math.floor(Math.random() * 9000 + 1000);
+let localRoomName = 'CHAT';
+let lastNetworkSend = 0;
+const SEND_INTERVAL = 1000 / 20; // 20fps
+const PLAYER_COLORS = [
+  0x6c8eff, 0xff6c8e, 0x6cffb4, 0xffca6c,
+  0xcc6cff, 0xff8c6c, 0x6ce4ff, 0xb4ff6c,
+];
+
+// UI Elements
+const statusDisplay = document.getElementById('status-display') as HTMLParagraphElement;
+const loadingOverlay = document.getElementById('loading-overlay') as HTMLDivElement;
+const autoRotateCheckbox = document.getElementById('auto-rotate') as HTMLInputElement;
+const lookAtMouseCheckbox = document.getElementById('look-at-mouse') as HTMLInputElement;
+const webcamBtn = document.getElementById('webcam-btn') as HTMLButtonElement;
+const videoElement = document.getElementById('video') as HTMLVideoElement;
+
+// Face Tracking
+let faceMesh: any;
+let cameraManager: any;
+
+init();
+animate();
+
+function init() {
+  const container = document.getElementById('canvas-container');
+  if (!container) return;
+
+  // Scene setup
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color('#1a1c23');
+  scene.fog = new THREE.Fog('#1a1c23', 10, 50);
+
+  // Camera setup
+  camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+  camera.position.set(0, 1.3, 3);
+  lookAtTarget.position.set(0, 1.3, 3);
+  scene.add(lookAtTarget);
+
+  // Renderer setup
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  container.appendChild(renderer.domElement);
+
+  // Controls setup
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.0, 0);
+  controls.update();
+
+  // Lighting
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+  scene.add(ambientLight);
+
+  mainLight = new THREE.DirectionalLight(0xffffff, 2.0);
+  mainLight.position.set(2, 5, 3);
+  mainLight.castShadow = true;
+  mainLight.shadow.mapSize.width = 1024;
+  mainLight.shadow.mapSize.height = 1024;
+  // Reduce shadow bias to prevent shadow acne as the sun moves
+  mainLight.shadow.bias = -0.0005;
+  scene.add(mainLight);
+
+  // Visual Sun Sphere in the sky
+  const sunGeo = new THREE.SphereGeometry(1.2, 16, 16);
+  const sunMat = new THREE.MeshBasicMaterial({ color: 0xffdd66 });
+  sunSphere = new THREE.Mesh(sunGeo, sunMat);
+  scene.add(sunSphere);
+
+  const fillLight = new THREE.DirectionalLight(0xa0a5b1, 0.8);
+  fillLight.position.set(-2, 2, -2);
+  scene.add(fillLight);
+
+  // Build Default Virtual Stage (World)
+  buildDefaultWorld();
+
+  // Event Listeners
+  window.addEventListener('resize', onWindowResize);
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('click', onClick);
+  
+  // Keyboard Listeners
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+
+  const fileInput = document.getElementById('model-upload') as HTMLInputElement;
+  fileInput.addEventListener('change', handleFileUpload);
+
+  const worldFileInput = document.getElementById('world-upload') as HTMLInputElement;
+  worldFileInput.addEventListener('change', handleWorldUpload);
+
+  const skyboxFileInput = document.getElementById('skybox-upload') as HTMLInputElement;
+  skyboxFileInput.addEventListener('change', handleSkyboxUpload);
+  
+  webcamBtn.addEventListener('click', toggleWebcam);
+
+  // Network UI
+  const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement;
+  const nameInput  = document.getElementById('player-name') as HTMLInputElement;
+  const roomInput  = document.getElementById('room-name') as HTMLInputElement;
+  nameInput.value  = localPlayerName;
+  roomInput.value  = localRoomName;
+  nameInput.addEventListener('change', () => { localPlayerName = nameInput.value.trim() || localPlayerName; });
+  roomInput.addEventListener('change', () => { localRoomName = roomInput.value.trim() || 'CHAT'; });
+  connectBtn.addEventListener('click', () => {
+    if (socket && socket.connected) {
+      disconnectNetwork();
+      connectBtn.textContent = '🌐 サーバー接続';
+      connectBtn.classList.remove('active');
+    } else {
+      localPlayerName = nameInput.value.trim() || localPlayerName;
+      localRoomName   = roomInput.value.trim() || 'CHAT';
+      initNetwork();
+      connectBtn.textContent = '⛔ 切断';
+      connectBtn.classList.add('active');
+    }
+  });
+
+  // QR Code Popup Event
+  const qrBtn = document.getElementById('qr-btn') as HTMLButtonElement;
+  const qrModal = document.getElementById('qr-modal') as HTMLDivElement;
+  const qrImage = document.getElementById('qr-image') as HTMLImageElement;
+  const qrUrlText = document.getElementById('qr-url-text') as HTMLDivElement;
+  const modalClose = document.getElementById('modal-close') as HTMLButtonElement;
+
+  qrBtn.addEventListener('click', () => {
+    // Determine target IP: use 192.168.10.19 if localhost, otherwise use current hostname
+    const hostname = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' 
+      ? '192.168.10.19' 
+      : window.location.hostname;
+    const port = window.location.port ? `:${window.location.port}` : '';
+    const connectUrl = `${window.location.protocol}//${hostname}${port}/`;
+    
+    // QR Code API
+    const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(connectUrl)}`;
+    
+    qrImage.src = qrApiUrl;
+    qrUrlText.textContent = connectUrl;
+    qrModal.classList.add('active');
+  });
+
+  modalClose.addEventListener('click', () => {
+    qrModal.classList.remove('active');
+  });
+
+  // Toggle Control Panel
+  const panelToggle = document.getElementById('panel-toggle') as HTMLButtonElement;
+  const controlsPanel = document.querySelector('.controls-panel') as HTMLDivElement;
+
+  panelToggle.addEventListener('click', () => {
+    const isCollapsed = controlsPanel.classList.toggle('collapsed');
+    if (isCollapsed) {
+      panelToggle.textContent = '⚙️ メニューを開く';
+      panelToggle.style.bottom = '2rem';
+      panelToggle.style.left = '2rem';
+    } else {
+      panelToggle.textContent = '⚙️ メニューを閉じる';
+    }
+  });
+
+  // Global Error Catch to show in UI
+  window.addEventListener('error', (event) => {
+    statusDisplay.innerText = `⚠️ エラー: ${event.message}`;
+    statusDisplay.style.color = '#ff6c8e';
+  });
+
+  // World adjustment UI wiring
+  const worldPosX = document.getElementById('world-pos-x') as HTMLInputElement;
+  const worldPosY = document.getElementById('world-pos-y') as HTMLInputElement;
+  const worldPosZ = document.getElementById('world-pos-z') as HTMLInputElement;
+  const worldRotY = document.getElementById('world-rot-y') as HTMLInputElement;
+  const worldScale = document.getElementById('world-scale') as HTMLInputElement;
+
+  const valWorldX = document.getElementById('val-world-x') as HTMLSpanElement;
+  const valWorldY = document.getElementById('val-world-y') as HTMLSpanElement;
+  const valWorldZ = document.getElementById('val-world-z') as HTMLSpanElement;
+  const valWorldRotY = document.getElementById('val-world-roty') as HTMLSpanElement;
+  const valWorldScale = document.getElementById('val-world-scale') as HTMLSpanElement;
+
+  function updateWorldTransforms() {
+    if (!currentWorld) return;
+    const x = parseFloat(worldPosX.value);
+    const y = parseFloat(worldPosY.value);
+    const z = parseFloat(worldPosZ.value);
+    const rY = THREE.MathUtils.degToRad(parseFloat(worldRotY.value));
+    const s = parseFloat(worldScale.value);
+
+    currentWorld.position.set(x, y, z);
+    currentWorld.rotation.y = rY;
+    currentWorld.scale.setScalar(s);
+
+    valWorldX.textContent = x.toFixed(1);
+    valWorldY.textContent = y.toFixed(1);
+    valWorldZ.textContent = z.toFixed(1);
+    valWorldRotY.textContent = worldRotY.value;
+    valWorldScale.textContent = s.toFixed(2);
+  }
+
+  worldPosX.addEventListener('input', updateWorldTransforms);
+  worldPosY.addEventListener('input', updateWorldTransforms);
+  worldPosZ.addEventListener('input', updateWorldTransforms);
+  worldRotY.addEventListener('input', updateWorldTransforms);
+  worldScale.addEventListener('input', updateWorldTransforms);
+
+  // Sun and Time UI wiring
+  const sunTimeSlider = document.getElementById('sun-time') as HTMLInputElement;
+  const sunSpeedSlider = document.getElementById('sun-speed') as HTMLInputElement;
+  const sunColorPicker = document.getElementById('sun-color') as HTMLInputElement;
+  const resetSunColorBtn = document.getElementById('reset-sun-color') as HTMLButtonElement;
+
+  const valSunTime = document.getElementById('val-sun-time') as HTMLSpanElement;
+  const valSunSpeed = document.getElementById('val-sun-speed') as HTMLSpanElement;
+
+  sunTimeSlider.addEventListener('input', () => {
+    sunTimeAngle = parseFloat(sunTimeSlider.value);
+    valSunTime.textContent = sunTimeSlider.value;
+  });
+
+  sunSpeedSlider.addEventListener('input', () => {
+    sunSpeedFactor = parseFloat(sunSpeedSlider.value);
+    valSunSpeed.textContent = sunSpeedFactor.toFixed(1);
+  });
+
+  sunColorPicker.addEventListener('input', () => {
+    customSunColor.set(sunColorPicker.value);
+    isCustomSunColor = true;
+  });
+
+  resetSunColorBtn.addEventListener('click', () => {
+    isCustomSunColor = false;
+    sunColorPicker.value = '#ffffff';
+  });
+
+  // Avatar selector UI wiring
+  const avatarSelect = document.getElementById('avatar-select') as HTMLSelectElement;
+  avatarSelect.addEventListener('change', () => {
+    switchActiveAvatar(parseInt(avatarSelect.value));
+  });
+}
+
+
+function handleFileUpload(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  const url = URL.createObjectURL(file);
+  const extension = file.name.split('.').pop()?.toLowerCase();
+
+  loadingOverlay.classList.remove('hidden');
+  statusDisplay.innerText = `${file.name} を読み込み中...`;
+
+  if (extension === 'vrm') {
+    loadVRM(url, file.name);
+  } else if (extension === 'fbx') {
+    loadFBX(url, file.name);
+  } else {
+    statusDisplay.innerText = '未対応のファイル形式です。';
+    loadingOverlay.classList.add('hidden');
+    URL.revokeObjectURL(url);
+  }
+}
+
+function updateAvatarSelector() {
+  const selectorGroup = document.getElementById('avatar-selector-group') as HTMLDivElement;
+  const selectEl = document.getElementById('avatar-select') as HTMLSelectElement;
+  if (!selectorGroup || !selectEl) return;
+
+  if (loadedAvatars.length >= 2) {
+    selectorGroup.style.display = 'block';
+  } else {
+    selectorGroup.style.display = 'none';
+  }
+
+  selectEl.innerHTML = '';
+  loadedAvatars.forEach((avatar, index) => {
+    const option = document.createElement('option');
+    option.value = index.toString();
+    option.textContent = `${index + 1}: ${avatar.name}`;
+    if (index === activeAvatarIndex) {
+      option.selected = true;
+    }
+    selectEl.appendChild(option);
+  });
+}
+
+function switchActiveAvatar(index: number) {
+  if (index < 0 || index >= loadedAvatars.length) return;
+  activeAvatarIndex = index;
+
+  const active = loadedAvatars[index];
+  if (active.type === 'vrm') {
+    currentVrm = active.vrm;
+    currentFbx = undefined;
+  } else {
+    currentVrm = undefined;
+    currentFbx = active.fbx;
+    if (currentFbx) {
+      fbxMixer = new THREE.AnimationMixer(currentFbx);
+      if (currentFbx.animations && currentFbx.animations.length > 0) {
+        const action = fbxMixer.clipAction(currentFbx.animations[0]);
+        action.play();
+      }
+    }
+  }
+
+  // Adjust camera and OrbitControls focus onto the active avatar
+  const modelObj = active.type === 'vrm' ? active.vrm?.scene : active.fbx;
+  if (modelObj && controls) {
+    const box = new THREE.Box3().setFromObject(modelObj);
+    const height = box.max.y - box.min.y;
+    controls.target.copy(modelObj.position).add(new THREE.Vector3(0, (height > 0 ? height : 1.6) * 0.7, 0));
+    controls.update();
+  }
+}
+
+function loadVRM(url: string, name: string) {
+  const loader = new GLTFLoader();
+  loader.register((parser) => new VRMLoaderPlugin(parser));
+
+  loader.load(
+    url,
+    (gltf) => {
+      const vrm = gltf.userData.vrm as VRM;
+
+      vrm.scene.traverse((obj: THREE.Object3D) => {
+        obj.frustumCulled = false;
+        if ((obj as THREE.Mesh).isMesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+        }
+        (obj as any).matrixAutoUpdate = true;
+      });
+
+      // Calculate staggered position for multiple avatars
+      let initialX = 0;
+      if (loadedAvatars.length > 0) {
+        const side = loadedAvatars.length % 2 === 0 ? -1 : 1;
+        const multiplier = Math.ceil(loadedAvatars.length / 2);
+        initialX = side * multiplier * 1.5;
+      }
+      vrm.scene.position.set(initialX, 0, 0);
+      scene.add(vrm.scene);
+
+      if (vrm.lookAt) {
+        vrm.lookAt.target = lookAtTarget;
+      }
+
+      // Store in loadedAvatars array
+      loadedAvatars.push({
+        id: Math.random().toString(36).substring(2, 9),
+        name: name,
+        type: 'vrm',
+        vrm: vrm,
+        initialX: initialX
+      });
+
+      // Select new avatar automatically
+      switchActiveAvatar(loadedAvatars.length - 1);
+      updateAvatarSelector();
+
+      statusDisplay.innerText = `${name} のロード完了！`;
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    },
+    undefined,
+    (error) => {
+      console.error(error);
+      statusDisplay.innerText = 'VRMのロード中にエラーが発生しました。';
+      loadingOverlay.classList.add('hidden');
+    }
+  );
+}
+
+function loadFBX(url: string, name: string) {
+  const loader = new FBXLoader();
+  loader.load(
+    url,
+    (object) => {
+      object.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+        }
+      });
+      object.scale.set(0.01, 0.01, 0.01);
+
+      // Calculate staggered position
+      let initialX = 0;
+      if (loadedAvatars.length > 0) {
+        const side = loadedAvatars.length % 2 === 0 ? -1 : 1;
+        const multiplier = Math.ceil(loadedAvatars.length / 2);
+        initialX = side * multiplier * 1.5;
+      }
+      object.position.set(initialX, 0, 0);
+      scene.add(object);
+
+      // Store in loadedAvatars array
+      loadedAvatars.push({
+        id: Math.random().toString(36).substring(2, 9),
+        name: name,
+        type: 'fbx',
+        fbx: object,
+        initialX: initialX
+      });
+
+      // Select new avatar automatically
+      switchActiveAvatar(loadedAvatars.length - 1);
+      updateAvatarSelector();
+
+      statusDisplay.innerText = `${name} のロード完了！`;
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    },
+    undefined,
+    (error) => {
+      console.error(error);
+      statusDisplay.innerText = 'FBXのロード中にエラーが発生しました。';
+      loadingOverlay.classList.add('hidden');
+    }
+  );
+}
+
+
+/* ============================
+ * INTERACTIONS & CONTROLS
+ * ============================ */
+
+function onMouseMove(event: MouseEvent) {
+  // If camera tracking is active, don't use mouse for head rotation
+  if (!lookAtMouseCheckbox.checked || isCameraTracking) return;
+
+  const x = (event.clientX / window.innerWidth) * 2 - 1;
+  const y = -(event.clientY / window.innerHeight) * 2 + 1;
+  const headHeight = camera.position.y;
+  lookAtTarget.position.set(x * 2.0, headHeight + y * 2.0, 3);
+}
+
+function onClick(event: MouseEvent) {
+  if (event.target !== renderer.domElement || isCameraTracking) return;
+  // Click to look at exactly
+  const x = (event.clientX / window.innerWidth) * 2 - 1;
+  const y = -(event.clientY / window.innerHeight) * 2 + 1;
+  lookAtTarget.position.set(x * 5, y * 5 + 1.5, 3);
+}
+
+function onKeyDown(e: KeyboardEvent) {
+  const k = e.key.toLowerCase();
+  if (keys.hasOwnProperty(k)) keys[k as keyof typeof keys] = true;
+  
+  if (e.code === 'Space' && !isJumping) {
+    jumpVelocity = 4.0;
+    isJumping = true;
+  }
+
+  // Handle Expressions for VRM (Keys 1-5)
+  if (currentVrm && currentVrm.expressionManager) {
+    if (e.key === '1') setExpression('happy');
+    if (e.key === '2') setExpression('angry');
+    if (e.key === '3') setExpression('sad');
+    if (e.key === '4') setExpression('relaxed');
+    if (e.key === '5') setExpression('neutral');
+  }
+}
+
+function onKeyUp(e: KeyboardEvent) {
+  const k = e.key.toLowerCase();
+  if (keys.hasOwnProperty(k)) keys[k as keyof typeof keys] = false;
+}
+
+function setExpression(name: string) {
+  if (!currentVrm || !currentVrm.expressionManager) return;
+  const expressions = ['happy', 'angry', 'sad', 'relaxed', 'neutral'];
+  expressions.forEach(exp => {
+    currentVrm!.expressionManager!.setValue(exp, 0);
+  });
+  if (name !== 'neutral') {
+    currentVrm.expressionManager.setValue(name, 1);
+  }
+}
+
+/* ============================
+ * WEBCAM & MEDIAPIPE TRACKING
+ * ============================ */
+
+async function toggleWebcam() {
+  if (isCameraTracking) {
+    stopWebcam();
+  } else {
+    startWebcam();
+  }
+}
+
+function startWebcam() {
+  isCameraTracking = true;
+  webcamBtn.classList.add('active');
+  webcamBtn.innerHTML = '<span>🛑 カメラトラッキング停止</span>';
+  videoElement.style.display = 'block';
+  statusDisplay.innerText = 'カメラを初期化中...';
+
+  if (!faceMesh) {
+    faceMesh = new FaceMesh({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+    });
+    faceMesh.setOptions({
+      maxNumFaces: 1,
+      refineLandmarks: true,
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    faceMesh.onResults(onFaceResults);
+  }
+
+  if (!cameraManager) {
+    cameraManager = new Camera(videoElement, {
+      onFrame: async () => {
+        await faceMesh.send({ image: videoElement });
+      },
+      width: 320,
+      height: 240
+    });
+  }
+  cameraManager.start();
+}
+
+function stopWebcam() {
+  isCameraTracking = false;
+  webcamBtn.classList.remove('active');
+  webcamBtn.innerHTML = '<span>📷 カメラトラッキング開始</span>';
+  videoElement.style.display = 'none';
+  if (cameraManager) {
+    cameraManager.stop();
+  }
+  statusDisplay.innerText = 'カメラ停止';
+  
+  // Reset VRM head
+  if (currentVrm) {
+    const head = currentVrm.humanoid.getRawBoneNode('head');
+    if (head) head.rotation.set(0, 0, 0);
+  }
+}
+
+function onFaceResults(results: any) {
+  if (!currentVrm || !isCameraTracking) return;
+
+  if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+    const faceLandmarks = results.multiFaceLandmarks[0];
+    
+    // Use Kalidokit to solve face tracking
+    const riggedFace = Kalidokit.Face.solve(faceLandmarks, {
+      runtime: 'mediapipe',
+      video: videoElement
+    });
+
+    if (riggedFace) {
+      applyFaceTracking(riggedFace);
+    }
+  }
+}
+
+function applyFaceTracking(riggedFace: any) {
+  if (!currentVrm) return;
+
+  // 1. Head Rotation
+  const headNode = currentVrm.humanoid.getRawBoneNode('head');
+  const neckNode = currentVrm.humanoid.getRawBoneNode('neck');
+  if (headNode) {
+    // Kalidokit gives euler angles in radians, but we might need to adjust axes
+    // X = Pitch, Y = Yaw, Z = Roll
+    const damp = 0.8; // Dampen the movement a bit
+    headNode.rotation.x = riggedFace.head.x * damp;
+    headNode.rotation.y = riggedFace.head.y * damp;
+    headNode.rotation.z = riggedFace.head.z * damp;
+    
+    // Spread some rotation to neck
+    if (neckNode) {
+        neckNode.rotation.x = riggedFace.head.x * (1 - damp);
+        neckNode.rotation.y = riggedFace.head.y * (1 - damp);
+        neckNode.rotation.z = riggedFace.head.z * (1 - damp);
+    }
+  }
+
+  // 2. Expressions (Blinking & Mouth)
+  if (currentVrm.expressionManager) {
+    currentVrm.expressionManager.setValue('blinkLeft', riggedFace.eye.l);
+    currentVrm.expressionManager.setValue('blinkRight', riggedFace.eye.r);
+    
+    // Simple mouth open 'aa' sound
+    currentVrm.expressionManager.setValue('aa', riggedFace.mouth.y);
+  }
+}
+
+/* ============================
+ * ANIMATION LOOP
+ * ============================ */
+
+function onWindowResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  try {
+    const delta = clock.getDelta();
+    // Move the Sun (mainLight) across the sky (Day/Night Cycle)
+    const sunBaseSpeed = 8.0; // Base degrees per second
+    if (sunSpeedFactor > 0) {
+      sunTimeAngle = (sunTimeAngle + delta * sunBaseSpeed * sunSpeedFactor) % 360;
+      
+      // Sync UI slider and label when auto-moving
+      const sunTimeSlider = document.getElementById('sun-time') as HTMLInputElement;
+      const valSunTime = document.getElementById('val-sun-time') as HTMLSpanElement;
+      if (sunTimeSlider) sunTimeSlider.value = Math.round(sunTimeAngle).toString();
+      if (valSunTime) valSunTime.textContent = Math.round(sunTimeAngle).toString();
+    }
+
+    const sunAngleRad = THREE.MathUtils.degToRad(sunTimeAngle);
+    const sunRadius = 30;  // Orbit radius
+    
+    // Orbit the sun in a circle
+    mainLight.position.x = Math.cos(sunAngleRad) * sunRadius;
+    mainLight.position.y = Math.sin(sunAngleRad) * sunRadius;
+    mainLight.position.z = Math.sin(sunAngleRad * 0.5) * sunRadius;
+    
+    // Keep the visual Sun Sphere matching the light's position
+    sunSphere.position.copy(mainLight.position);
+
+    // Adjust light color & intensity based on height (Day/Night Cycle)
+    const sunHeight = mainLight.position.y;
+    if (sunHeight > 0) {
+      // Day / Golden Hour
+      const ratio = THREE.MathUtils.clamp(sunHeight / sunRadius, 0, 1);
+      
+      // Lighter during peak noon, warmer/softer at horizon
+      mainLight.intensity = THREE.MathUtils.mapLinear(ratio, 0, 1, 0.4, 2.5);
+      
+      if (isCustomSunColor) {
+        mainLight.color.copy(customSunColor);
+        (sunSphere.material as THREE.MeshBasicMaterial).color.copy(customSunColor);
+      } else {
+        // HSL: interpolate from orange/red (0.05) to light yellow (0.13)
+        mainLight.color.setHSL(0.05 + ratio * 0.08, 1.0, 0.55 + ratio * 0.25);
+        // Make the sun sphere look bright yellow-white
+        (sunSphere.material as THREE.MeshBasicMaterial).color.setHSL(0.08 + ratio * 0.05, 1.0, 0.7);
+      }
+    } else {
+      // Night (cool dim moonlight)
+      const ratio = THREE.MathUtils.clamp(-sunHeight / sunRadius, 0, 1);
+      mainLight.intensity = THREE.MathUtils.mapLinear(ratio, 0, 1, 0.4, 0.15);
+      
+      if (isCustomSunColor) {
+        // Dim custom color at night
+        mainLight.color.copy(customSunColor).multiplyScalar(0.25);
+        (sunSphere.material as THREE.MeshBasicMaterial).color.copy(customSunColor).multiplyScalar(0.15);
+      } else {
+        mainLight.color.setRGB(0.2, 0.25, 0.4); // Dark blue moonlight
+        // Dim the sun sphere into a dark blue/gray
+        (sunSphere.material as THREE.MeshBasicMaterial).color.setRGB(0.1, 0.12, 0.2);
+      }
+    }
+
+    // Handle Model Movement
+    let modelObj = currentVrm ? currentVrm.scene : (currentFbx ? currentFbx : null);
+    if (modelObj) {
+      const moveSpeed = 2.0 * delta;
+      if (keys.w) modelObj.position.z -= moveSpeed;
+      if (keys.s) modelObj.position.z += moveSpeed;
+      if (keys.a) modelObj.position.x -= moveSpeed;
+      if (keys.d) modelObj.position.x += moveSpeed;
+
+      // Handle Jump Physics
+      if (isJumping) {
+        modelObj.position.y += jumpVelocity * delta;
+        jumpVelocity -= 9.8 * delta; // Gravity
+        if (modelObj.position.y <= 0) {
+          modelObj.position.y = 0;
+          isJumping = false;
+          jumpVelocity = 0;
+        }
+      }
+    }
+
+    // Auto Rotation
+    if (autoRotateCheckbox.checked && modelObj) {
+      modelObj.rotation.y += delta * 0.5;
+    }
+
+    // --- Update ALL loaded avatars ---
+    loadedAvatars.forEach((avatar, index) => {
+      const isActive = index === activeAvatarIndex;
+      
+      if (avatar.type === 'vrm' && avatar.vrm) {
+        // Auto Blink (only if camera isn't tracking)
+        if (!isCameraTracking) {
+          const time = clock.getElapsedTime();
+          if (avatar.vrm.expressionManager) {
+             const blinkWeight = Math.sin(time * 3 + index) > 0.95 ? 1 : 0; // offset blinking slightly
+             avatar.vrm.expressionManager.setValue('blink', blinkWeight);
+          }
+        }
+
+        if (isActive) {
+          // Active VRM (controlled by keyboard or tracking)
+          if (!isCameraTracking) {
+            if (isJumping) {
+              currentAnimState = 'jump';
+            } else if (keys.w) {
+              currentAnimState = 'walk';
+            } else if (keys.s) {
+              currentAnimState = 'walkBack';
+            } else if (keys.a) {
+              currentAnimState = 'strafeLeft';
+            } else if (keys.d) {
+              currentAnimState = 'strafeRight';
+            } else {
+              currentAnimState = 'idle';
+            }
+
+            const speedMultiplier = 8;
+            if (currentAnimState !== 'idle' && currentAnimState !== 'jump') {
+              walkTime += delta * speedMultiplier;
+            }
+            updateProceduralAnimation(avatar.vrm, currentAnimState, walkTime, delta);
+          }
+        } else {
+          // Inactive VRM (plays idle breathing animation)
+          updateProceduralAnimation(avatar.vrm, 'idle', 0, delta);
+        }
+
+        // Always update the VRM humanoid solver
+        avatar.vrm.update(delta);
+
+      } else if (avatar.type === 'fbx' && avatar.fbx) {
+        if (isActive && fbxMixer) {
+          fbxMixer.update(delta);
+        }
+      }
+    });
+
+    // --- Interpolate remote players ---
+    remotePlayers.forEach((rp) => {
+      rp.group.position.lerp(rp.targetPos, 0.15);
+      rp.group.rotation.y = THREE.MathUtils.lerp(rp.group.rotation.y, rp.targetRotY, 0.15);
+      // Billboard name label toward camera
+      rp.nameSprite.quaternion.copy(camera.quaternion);
+    });
+
+    // --- Send local state to server ---
+    if (socket && socket.connected) {
+      const now = performance.now();
+      if (now - lastNetworkSend > SEND_INTERVAL) {
+        lastNetworkSend = now;
+        const modelObj = currentVrm ? currentVrm.scene : currentFbx ?? null;
+        const pos = modelObj ? modelObj.position : new THREE.Vector3();
+        const rotY = modelObj ? modelObj.rotation.y : 0;
+        socket.emit('state', {
+          name: localPlayerName,
+          position:  { x: pos.x, y: pos.y, z: pos.z },
+          rotationY: rotY,
+          boneRots:  { ...boneRotations },
+        } satisfies RemotePlayerState);
+      }
+    }
+
+    controls.update();
+    renderer.render(scene, camera);
+  } catch (err: any) {
+    console.error("Animate Loop Error:", err);
+    statusDisplay.innerText = `⚠️ 描画エラー: ${err.message || err}`;
+    statusDisplay.style.color = '#ff6c8e';
+  }
+}
+
+/* ============================
+ * MULTIPLAYER NETWORK
+ * ============================ */
+
+function hashColor(id: string): number {
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) hash = (id.charCodeAt(i) + ((hash << 5) - hash)) | 0;
+  return PLAYER_COLORS[Math.abs(hash) % PLAYER_COLORS.length];
+}
+
+function createNameSprite(name: string, colorHex: number): THREE.Sprite {
+  const canvas  = document.createElement('canvas');
+  canvas.width  = 320;
+  canvas.height = 72;
+  const ctx = canvas.getContext('2d')!;
+  ctx.fillStyle = 'rgba(10,12,20,0.75)';
+  ctx.fillRect(0, 0, 320, 72);
+  const c = new THREE.Color(colorHex);
+  ctx.font = 'bold 32px Outfit, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = `#${c.getHexString()}`;
+  ctx.fillText(name.substring(0, 18), 160, 36);
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(1.4, 0.32, 1);
+  sprite.renderOrder = 999;
+  return sprite;
+}
+
+function createRemotePlayerMesh(id: string, name: string): RemotePlayerObj {
+  const colorHex = hashColor(id);
+  const color    = new THREE.Color(colorHex);
+  const mat      = new THREE.MeshLambertMaterial({ color });
+  const group    = new THREE.Group();
+
+  // Torso
+  const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.15, 0.5, 4, 8), mat);
+  torso.position.y = 0.9;
+  group.add(torso);
+
+  // Head
+  const headMesh = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 8), mat);
+  headMesh.position.y = 1.52;
+  group.add(headMesh);
+
+  // Eyes (white dots)
+  const eyeMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const lEye = new THREE.Mesh(new THREE.SphereGeometry(0.035, 6, 6), eyeMat);
+  lEye.position.set(0.07, 1.55, 0.14);
+  group.add(lEye);
+  const rEye = new THREE.Mesh(new THREE.SphereGeometry(0.035, 6, 6), eyeMat);
+  rEye.position.set(-0.07, 1.55, 0.14);
+  group.add(rEye);
+
+  // Arms
+  const armGeo = new THREE.CapsuleGeometry(0.055, 0.38, 4, 8);
+  const lArm   = new THREE.Mesh(armGeo, mat);
+  lArm.position.set( 0.27, 1.0, 0);
+  lArm.rotation.z = 0.35;
+  group.add(lArm);
+  const rArm = new THREE.Mesh(armGeo, mat);
+  rArm.position.set(-0.27, 1.0, 0);
+  rArm.rotation.z = -0.35;
+  group.add(rArm);
+
+  // Legs
+  const legGeo = new THREE.CapsuleGeometry(0.07, 0.48, 4, 8);
+  const lLeg   = new THREE.Mesh(legGeo, mat);
+  lLeg.position.set( 0.1, 0.34, 0);
+  group.add(lLeg);
+  const rLeg = new THREE.Mesh(legGeo, mat);
+  rLeg.position.set(-0.1, 0.34, 0);
+  group.add(rLeg);
+
+  // Name label
+  const nameSprite = createNameSprite(name || id.substring(0, 8), colorHex);
+  nameSprite.position.y = 1.95;
+  group.add(nameSprite);
+
+  scene.add(group);
+
+  return {
+    group, head: headMesh, nameSprite,
+    targetPos: new THREE.Vector3(),
+    targetRotY: 0,
+  };
+}
+
+function applyRemotePlayerState(rp: RemotePlayerObj, state: RemotePlayerState) {
+  rp.targetPos.set(state.position.x, state.position.y, state.position.z);
+  rp.targetRotY = state.rotationY;
+}
+
+function removeRemotePlayer(id: string) {
+  const rp = remotePlayers.get(id);
+  if (rp) {
+    scene.remove(rp.group);
+    rp.group.traverse((o) => {
+      if ((o as THREE.Mesh).geometry) (o as THREE.Mesh).geometry.dispose();
+      const m = (o as THREE.Mesh).material;
+      if (m) Array.isArray(m) ? m.forEach(x => x.dispose()) : (m as THREE.Material).dispose();
+    });
+    remotePlayers.delete(id);
+  }
+}
+
+function initNetwork() {
+  // Determine server URL: use port 3001 for local/LAN development, otherwise use the host origin for production
+  const serverUrl = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1' || window.location.hostname.startsWith('192.168.')
+    ? `http://${window.location.hostname}:3001`
+    : `${window.location.protocol}//${window.location.host}`;
+    
+  socket = io(serverUrl);
+
+  socket.on('connect', () => {
+    console.log('[Network] Connected:', socket!.id);
+    // 接続後すぐにルームに参加
+    socket!.emit('join-room', { room: localRoomName, name: localPlayerName });
+  });
+
+  socket.on('room-joined', ({ room, playerCount }: { room: string; playerCount: number }) => {
+    updateNetworkStatus(true, room, playerCount);
+    console.log(`[Network] Joined room: ${room} (${playerCount} players)`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('[Network] Disconnected');
+    updateNetworkStatus(false);
+    remotePlayers.forEach((_, id) => removeRemotePlayer(id));
+  });
+
+  // 既存プレイヤー一覧を受信
+  socket.on('init', (players: Array<{ id: string } & RemotePlayerState>) => {
+    players.forEach(({ id, ...state }) => {
+      if (!remotePlayers.has(id)) {
+        remotePlayers.set(id, createRemotePlayerMesh(id, state.name));
+      }
+      applyRemotePlayerState(remotePlayers.get(id)!, state);
+    });
+  });
+
+  // 新規参加
+  socket.on('player-joined', ({ id }: { id: string }) => {
+    if (!remotePlayers.has(id)) {
+      remotePlayers.set(id, createRemotePlayerMesh(id, id.substring(0, 8)));
+    }
+  });
+
+  // 状態更新
+  socket.on('player-state', ({ id, ...state }: { id: string } & RemotePlayerState) => {
+    if (!remotePlayers.has(id)) {
+      remotePlayers.set(id, createRemotePlayerMesh(id, state.name));
+    }
+    applyRemotePlayerState(remotePlayers.get(id)!, state);
+  });
+
+  // 退出
+  socket.on('player-left', ({ id }: { id: string }) => {
+    removeRemotePlayer(id);
+  });
+}
+
+function disconnectNetwork() {
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
+  remotePlayers.forEach((_, id) => removeRemotePlayer(id));
+  updateNetworkStatus(false);
+}
+
+function updateNetworkStatus(connected: boolean, room?: string, count?: number) {
+  const el = document.getElementById('network-status');
+  if (el) {
+    if (connected && room) {
+      el.textContent = `🟢 ${room} (${count}人)`;
+      el.style.color = '#6cffb4';
+    } else if (connected) {
+      el.textContent = '🟢 接続中';
+      el.style.color = '#6cffb4';
+    } else {
+      el.textContent = '🔴 未接続';
+      el.style.color = '#ff6c8e';
+    }
+  }
+}
+
+// Store current normalized bone rotation values for smooth lerping
+const boneRotations: Record<string, { x: number; y: number; z: number }> = {};
+
+function getBoneRot(key: string) {
+  if (!boneRotations[key]) boneRotations[key] = { x: 0, y: 0, z: 0 };
+  return boneRotations[key];
+}
+
+function updateProceduralAnimation(vrm: VRM, state: string, time: number, delta: number) {
+  const h = vrm.humanoid;
+  if (!h) return; // Guard in case humanoid is undefined
+
+
+  // Use getNormalizedBoneNode for VRM1.0 — this is what vrm.update() reads.
+  // getRawBoneNode returns the raw skeleton bone which vrm.update() overwrites.
+  const bones = {
+    lUpperArm: h.getNormalizedBoneNode('leftUpperArm'),
+    rUpperArm: h.getNormalizedBoneNode('rightUpperArm'),
+    lLowerArm: h.getNormalizedBoneNode('leftLowerArm'),
+    rLowerArm: h.getNormalizedBoneNode('rightLowerArm'),
+    lUpperLeg: h.getNormalizedBoneNode('leftUpperLeg'),
+    rUpperLeg: h.getNormalizedBoneNode('rightUpperLeg'),
+    lLowerLeg: h.getNormalizedBoneNode('leftLowerLeg'),
+    rLowerLeg: h.getNormalizedBoneNode('rightLowerLeg'),
+    spine:     h.getNormalizedBoneNode('spine'),
+    chest:     h.getNormalizedBoneNode('chest'),
+    hips:      h.getNormalizedBoneNode('hips'),
+  };
+
+  const elapsed = clock.getElapsedTime();
+
+  // --- Build target rotations (x, y, z) per bone ---
+  // Defaults = natural idle / A-pose in normalized space
+  const tgt: Record<string, { x: number; y: number; z: number }> = {
+    lUpperArm: { x: 0.1,  y: 0, z: -1.25 },  // A-pose: arms down and slightly forward
+    rUpperArm: { x: 0.1,  y: 0, z:  1.25 },
+    lLowerArm: { x: 0.2,  y: 0, z:  0    },  // slightly bent elbows
+    rLowerArm: { x: 0.2,  y: 0, z:  0    },
+    lUpperLeg: { x: 0,    y: 0, z:  0    },
+    rUpperLeg: { x: 0,    y: 0, z:  0    },
+    lLowerLeg: { x: 0,    y: 0, z:  0    },
+    rLowerLeg: { x: 0,    y: 0, z:  0    },
+    spine:     { x: 0.02, y: 0, z:  0    },
+    chest:     { x: 0.02, y: 0, z:  0    },
+    hips:      { x: 0,    y: 0, z:  0    },
+  };
+
+  if (state === 'idle') {
+    // Breathing cycle
+    const breathe = Math.sin(elapsed * 1.8);
+    
+    // Breathing movement on torso
+    tgt.chest.x = 0.02 + breathe * 0.012;
+    tgt.spine.x = 0.02 + breathe * 0.005;
+    
+    // Arm breathing sway
+    tgt.lUpperArm.z = -1.25 + breathe * 0.015;
+    tgt.rUpperArm.z =  1.25 - breathe * 0.015;
+    tgt.lUpperArm.x =  0.1 + breathe * 0.008;
+    tgt.rUpperArm.x =  0.1 + breathe * 0.008;
+    
+    // Elbow breathing sway
+    tgt.lLowerArm.x = 0.2 + breathe * 0.01;
+    tgt.rLowerArm.x = 0.2 + breathe * 0.01;
+    
+    // Subtle hip breathing sway
+    tgt.hips.y = breathe * 0.003;
+    tgt.hips.x = breathe * 0.002;
+
+  } else if (state === 'walk' || state === 'walkBack') {
+    const dir = state === 'walk' ? 1 : -1;
+    // Arm swing (opposite to legs)
+    tgt.lUpperArm.x = Math.sin(time + Math.PI) * 0.5 * dir;
+    tgt.rUpperArm.x = Math.sin(time)           * 0.5 * dir;
+    // Elbow bend during swing
+    tgt.lLowerArm.x = Math.max(0, Math.sin(time + Math.PI)) * 0.4;
+    tgt.rLowerArm.x = Math.max(0, Math.sin(time))           * 0.4;
+    // Leg stride
+    tgt.lUpperLeg.x = Math.sin(time)           * 0.6 * dir;
+    tgt.rUpperLeg.x = Math.sin(time + Math.PI) * 0.6 * dir;
+    // Knee bend (always positive — leg bends backward)
+    tgt.lLowerLeg.x = Math.max(0, -Math.sin(time))           * 0.9;
+    tgt.rLowerLeg.x = Math.max(0, -Math.sin(time + Math.PI)) * 0.9;
+    // Hip sway and spine counter-rotate for natural look
+    tgt.hips.z  = Math.sin(time * 2) * 0.04;
+    tgt.spine.z = -Math.sin(time * 2) * 0.03;
+    tgt.spine.x = 0.05; // slight forward lean
+    tgt.chest.x = state === 'walkBack' ? -0.06 : 0.04;
+
+  } else if (state === 'strafeLeft' || state === 'strafeRight') {
+    const dir = state === 'strafeLeft' ? 1 : -1;
+    tgt.lUpperArm.z = 0.4 + dir * 0.4;
+    tgt.rUpperArm.z = -0.4 + dir * 0.4;
+    tgt.lUpperLeg.z = Math.sin(time) * 0.25 * dir;
+    tgt.rUpperLeg.z = Math.sin(time) * 0.25 * dir;
+    tgt.spine.z     = dir * 0.05;
+
+  } else if (state === 'jump') {
+    tgt.lUpperArm.z =  1.8;  // arms raised
+    tgt.rUpperArm.z = -1.8;
+    tgt.lUpperArm.x = -0.2;
+    tgt.rUpperArm.x = -0.2;
+    tgt.lUpperLeg.x = -0.25; // legs slightly bent back
+    tgt.rUpperLeg.x = -0.25;
+    tgt.lLowerLeg.x =  0.5;
+    tgt.rLowerLeg.x =  0.5;
+    tgt.spine.x     = -0.05;
+  }
+
+  // Lerp stored rotations toward targets, then apply to normalized bones
+  const speed = state === 'jump' ? 14 : 9;
+  for (const key of Object.keys(tgt)) {
+    const bone = (bones as any)[key] as THREE.Object3D | null;
+    if (!bone) continue;
+
+    const cur = getBoneRot(key);
+    cur.x = THREE.MathUtils.lerp(cur.x, tgt[key].x, delta * speed);
+    cur.y = THREE.MathUtils.lerp(cur.y, tgt[key].y, delta * speed);
+    cur.z = THREE.MathUtils.lerp(cur.z, tgt[key].z, delta * speed);
+
+    bone.rotation.x = cur.x;
+    bone.rotation.y = cur.y;
+    bone.rotation.z = cur.z;
+  }
+}
+
+/* ============================
+ * 3D WORLD BUILDERS & LOADERS
+ * ============================ */
+
+function buildDefaultWorld() {
+  if (defaultWorldGroup) {
+    scene.remove(defaultWorldGroup);
+  }
+  defaultWorldGroup = new THREE.Group();
+
+  // 1. Cyber stage floor (circle)
+  const stageGeo = new THREE.CylinderGeometry(12, 12, 0.2, 32);
+  const stageMat = new THREE.MeshStandardMaterial({
+    color: 0x111625,
+    roughness: 0.2,
+    metalness: 0.8,
+  });
+  const stage = new THREE.Mesh(stageGeo, stageMat);
+  stage.position.y = -0.1;
+  stage.receiveShadow = true;
+  defaultWorldGroup.add(stage);
+
+  // Grid on top of the stage
+  const gridHelper = new THREE.GridHelper(24, 24, 0x6c8eff, 0x24344f);
+  gridHelper.position.y = 0.01;
+  defaultWorldGroup.add(gridHelper);
+
+  // 2. Neon ring around the stage
+  const ringGeo = new THREE.RingGeometry(11.8, 12, 64);
+  const ringMat = new THREE.MeshBasicMaterial({
+    color: 0x6c8eff,
+    side: THREE.DoubleSide,
+  });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  ring.rotation.x = Math.PI / 2;
+  ring.position.y = 0.02;
+  defaultWorldGroup.add(ring);
+
+  // 3. Cyber pillars (neon cylinders)
+  const pillarColor = [0x6c8eff, 0xff6c8e, 0x6cffb4];
+  for (let i = 0; i < 8; i++) {
+    const angle = (i / 8) * Math.PI * 2;
+    const radius = 15;
+    const height = 4 + Math.random() * 6;
+    
+    const pillarGeo = new THREE.CylinderGeometry(0.3, 0.3, height, 8);
+    const pillarMat = new THREE.MeshStandardMaterial({
+      color: 0x1f2330,
+      roughness: 0.1,
+      metalness: 0.9,
+    });
+    const pillar = new THREE.Mesh(pillarGeo, pillarMat);
+    pillar.position.set(Math.cos(angle) * radius, height / 2, Math.sin(angle) * radius);
+    pillar.castShadow = true;
+    pillar.receiveShadow = true;
+    defaultWorldGroup.add(pillar);
+
+    // Neon light strip on top of each pillar
+    const capGeo = new THREE.CylinderGeometry(0.32, 0.32, 0.3, 8);
+    const capMat = new THREE.MeshBasicMaterial({
+      color: pillarColor[i % pillarColor.length],
+    });
+    const cap = new THREE.Mesh(capGeo, capMat);
+    cap.position.set(Math.cos(angle) * radius, height + 0.15, Math.sin(angle) * radius);
+    defaultWorldGroup.add(cap);
+  }
+
+  // 4. Floating cyber particles
+  const particleGeo = new THREE.BufferGeometry();
+  const count = 120;
+  const positions = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    positions[i * 3] = (Math.random() - 0.5) * 30;     // X
+    positions[i * 3 + 1] = Math.random() * 10;          // Y
+    positions[i * 3 + 2] = (Math.random() - 0.5) * 30;  // Z
+  }
+  particleGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const particleMat = new THREE.PointsMaterial({
+    color: 0x6cffb4,
+    size: 0.15,
+    transparent: true,
+    opacity: 0.6,
+  });
+  const particles = new THREE.Points(particleGeo, particleMat);
+  defaultWorldGroup.add(particles);
+
+  scene.add(defaultWorldGroup);
+}
+
+function handleWorldUpload(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  const url = URL.createObjectURL(file);
+  const extension = file.name.split('.').pop()?.toLowerCase();
+
+  loadingOverlay.classList.remove('hidden');
+  statusDisplay.innerText = `${file.name} (ワールド) を読み込み中...`;
+
+  if (extension === 'glb' || extension === 'gltf') {
+    loadWorldGLTF(url);
+  } else if (extension === 'fbx') {
+    loadWorldFBX(url);
+  } else {
+    statusDisplay.innerText = '未対応のファイル形式です。';
+    loadingOverlay.classList.add('hidden');
+    URL.revokeObjectURL(url);
+  }
+}
+
+function clearCurrentWorld() {
+  if (currentWorld) {
+    scene.remove(currentWorld);
+    currentWorld.traverse((obj) => {
+      if ((obj as THREE.Mesh).geometry) (obj as THREE.Mesh).geometry.dispose();
+      // @ts-ignore
+      if (obj.material) {
+        // @ts-ignore
+        if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+        // @ts-ignore
+        else obj.material.dispose();
+      }
+    });
+    currentWorld = undefined;
+  }
+  if (defaultWorldGroup) {
+    defaultWorldGroup.visible = true; // Restore default cyber stage when custom world is cleared
+  }
+
+  // Hide the world adjustment UI
+  const worldAdjustUi = document.getElementById('world-adjust-ui');
+  if (worldAdjustUi) {
+    worldAdjustUi.style.display = 'none';
+  }
+}
+
+function initWorldAdjustUI() {
+  const worldAdjustUi = document.getElementById('world-adjust-ui') as HTMLDivElement;
+  if (!worldAdjustUi || !currentWorld) return;
+
+  const worldPosX = document.getElementById('world-pos-x') as HTMLInputElement;
+  const worldPosY = document.getElementById('world-pos-y') as HTMLInputElement;
+  const worldPosZ = document.getElementById('world-pos-z') as HTMLInputElement;
+  const worldRotY = document.getElementById('world-rot-y') as HTMLInputElement;
+  const worldScale = document.getElementById('world-scale') as HTMLInputElement;
+
+  const valWorldX = document.getElementById('val-world-x') as HTMLSpanElement;
+  const valWorldY = document.getElementById('val-world-y') as HTMLSpanElement;
+  const valWorldZ = document.getElementById('val-world-z') as HTMLSpanElement;
+  const valWorldRotY = document.getElementById('val-world-roty') as HTMLSpanElement;
+  const valWorldScale = document.getElementById('val-world-scale') as HTMLSpanElement;
+
+  // Reset sliders to align with the newly loaded model's initial state
+  worldPosX.value = "0";
+  worldPosY.value = "0";
+  worldPosZ.value = "0";
+  worldRotY.value = "0";
+  
+  const initialScale = currentWorld.scale.x;
+  worldScale.value = initialScale.toString();
+
+  // Update text labels
+  valWorldX.textContent = "0.0";
+  valWorldY.textContent = "0.0";
+  valWorldZ.textContent = "0.0";
+  valWorldRotY.textContent = "0";
+  valWorldScale.textContent = initialScale.toFixed(2);
+
+  // Show the adjustment panel
+  worldAdjustUi.style.display = 'block';
+}
+
+function loadWorldGLTF(url: string) {
+  const loader = new GLTFLoader();
+  loader.load(
+    url,
+    (gltf) => {
+      clearCurrentWorld();
+      currentWorld = gltf.scene;
+
+      currentWorld.traverse((obj: THREE.Object3D) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          obj.receiveShadow = true;
+          obj.castShadow = true;
+          const mesh = obj as THREE.Mesh;
+          if (mesh.material) {
+            (mesh.material as any).roughness = 0.8;
+          }
+        }
+        (obj as any).matrixAutoUpdate = true;
+      });
+
+      const box = new THREE.Box3().setFromObject(currentWorld);
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      
+      if (maxDim < 2) {
+        currentWorld.scale.setScalar(10);
+      }
+      
+      scene.add(currentWorld);
+      if (defaultWorldGroup) {
+        defaultWorldGroup.visible = false; // Hide default cyber stage/grid when custom world is loaded
+      }
+      initWorldAdjustUI(); // Initialize adjustment sliders
+
+      statusDisplay.innerText = 'ワールドの読み込みが完了しました！';
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    },
+    (xhr) => {
+      const percent = Math.round((xhr.loaded / xhr.total) * 100);
+      statusDisplay.innerText = `ワールド読み込み中... ${percent}%`;
+    },
+    (err) => {
+      console.error(err);
+      statusDisplay.innerText = 'ワールドの読み込みに失敗しました。';
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    }
+  );
+}
+
+function loadWorldFBX(url: string) {
+  const loader = new FBXLoader();
+  loader.load(
+    url,
+    (fbx) => {
+      clearCurrentWorld();
+      currentWorld = fbx;
+
+      currentWorld.traverse((obj: THREE.Object3D) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          obj.receiveShadow = true;
+          obj.castShadow = true;
+        }
+        (obj as any).matrixAutoUpdate = true;
+      });
+
+      const box = new THREE.Box3().setFromObject(currentWorld);
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      if (maxDim > 100) {
+        currentWorld.scale.setScalar(0.01);
+      } else if (maxDim < 2) {
+        currentWorld.scale.setScalar(5);
+      }
+
+      scene.add(currentWorld);
+      if (defaultWorldGroup) {
+        defaultWorldGroup.visible = false; // Hide default cyber stage/grid when custom world is loaded
+      }
+      initWorldAdjustUI(); // Initialize adjustment sliders
+
+      statusDisplay.innerText = 'ワールドの読み込みが完了しました！';
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    },
+    (xhr) => {
+      const percent = Math.round((xhr.loaded / xhr.total) * 100);
+      statusDisplay.innerText = `ワールド読み込み中... ${percent}%`;
+    },
+    (err) => {
+      console.error(err);
+      statusDisplay.innerText = 'ワールドの読み込みに失敗しました。';
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    }
+  );
+}
+
+function handleSkyboxUpload(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  const url = URL.createObjectURL(file);
+  loadingOverlay.classList.remove('hidden');
+  statusDisplay.innerText = `${file.name} (背景画像) を読み込み中...`;
+
+  const loader = new THREE.TextureLoader();
+  loader.load(
+    url,
+    (texture) => {
+      if (skyboxTexture) {
+        skyboxTexture.dispose();
+      }
+      
+      skyboxTexture = texture;
+      
+      // Map it as Equirectangular (360 degree panoramic sphere)
+      skyboxTexture.mapping = THREE.EquirectangularReflectionMapping;
+      skyboxTexture.colorSpace = THREE.SRGBColorSpace;
+
+      // Apply to background and environment reflection
+      scene.background = skyboxTexture;
+      scene.environment = skyboxTexture;
+
+      statusDisplay.innerText = '背景画像のロードが完了しました！';
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    },
+    undefined,
+    (err) => {
+      console.error(err);
+      statusDisplay.innerText = '背景画像のロードに失敗しました。';
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    }
+  );
+}
+
+
+

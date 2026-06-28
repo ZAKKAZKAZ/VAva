@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3Dアバタースタジオプロ</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="./src/style.css">
+    <!-- MediaPipe & Kalidokit CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/kalidokit@1.1.5/dist/kalidokit.umd.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <div id="canvas-container"></div>
+      
+      <!-- Webcam Preview -->
+      <video id="video" class="camera-preview" autoplay playsinline style="display: none;"></video>
+      <canvas id="guide-canvas" class="camera-preview" style="display: none;"></canvas>
+
+      <div class="ui-overlay">
+        <header class="header">
+          <h1>アバタースタジオ</h1>
+          <p>VRM / FBX の読み込みと操作</p>
+        </header>
+
+        <div class="controls-panel glassmorphism">
+          <div class="control-group">
+            <label for="model-upload" class="upload-btn">
+              <span>👤 アバターを読み込む (VRM/FBX)</span>
+              <input type="file" id="model-upload" accept=".vrm,.fbx" style="display: none;" />
+            </label>
+          </div>
+
+          <!-- Avatar Selector (Visible when 2+ avatars are loaded) -->
+          <div class="control-group" id="avatar-selector-group" style="display: none; border-top: 1px solid var(--glass-border); padding-top: 0.8rem; margin-bottom: 0.8rem;">
+            <label for="avatar-select" style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.4rem; display: block;">👤 操作するアバター:</label>
+            <select id="avatar-select" class="name-input" style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.2); color: white; border: 1px solid var(--glass-border); border-radius: 6px; outline: none; cursor: pointer;">
+              <!-- Dynamic options -->
+            </select>
+          </div>
+
+
+          <div class="control-group">
+            <label for="world-upload" class="upload-btn" style="background: linear-gradient(135deg, #ff6c8e, #ff8c6c); color: white;">
+              <span>🗺️ ワールドを読み込む (GLB/GLTF/FBX)</span>
+              <input type="file" id="world-upload" accept=".glb,.gltf,.fbx" style="display: none;" />
+            </label>
+          </div>
+
+          <div class="control-group">
+            <label for="skybox-upload" class="upload-btn" style="background: linear-gradient(135deg, #6a11cb, #2575fc); color: white;">
+              <span>🌌 背景を読み込む (パノラマ画像)</span>
+              <input type="file" id="skybox-upload" accept="image/*" style="display: none;" />
+            </label>
+          </div>
+
+
+          
+          <div class="control-group">
+            <button id="webcam-btn" class="action-btn">
+              <span>📷 カメラトラッキング開始</span>
+            </button>
+          </div>
+
+          <div class="control-group info-box">
+            <p><strong>[操作方法]</strong></p>
+            <p>・W/A/S/D : 移動</p>
+            <p>・スペース : ジャンプ</p>
+            <p>・1/2/3/4/5 : 表情変更</p>
+            <p>・クリック : アバターがクリック位置を見る</p>
+          </div>
+          
+          <div class="control-group">
+            <p class="status-text" id="status-display">準備完了</p>
+          </div>
+
+          <div class="control-group toggle-group">
+            <label>
+              <input type="checkbox" id="auto-rotate" />
+              自動回転
+            </label>
+            <label>
+              <input type="checkbox" id="look-at-mouse" checked />
+              マウスを見る (VRM)
+            </label>
+          </div>
+
+          <!-- World Transform Panel (Hidden by default) -->
+          <div class="control-group world-adjust-panel" id="world-adjust-ui" style="display: none; border-top: 1px solid var(--glass-border); padding-top: 1rem;">
+            <p class="section-title">🗺️ ワールド調整</p>
+            <div class="adjust-row">
+              <label>位置 X: <span id="val-world-x">0.0</span>m</label>
+              <input type="range" id="world-pos-x" min="-50" max="50" step="0.1" value="0" class="range-slider" />
+            </div>
+            <div class="adjust-row">
+              <label>位置 Y (高さ): <span id="val-world-y">0.0</span>m</label>
+              <input type="range" id="world-pos-y" min="-20" max="20" step="0.1" value="0" class="range-slider" />
+            </div>
+            <div class="adjust-row">
+              <label>位置 Z: <span id="val-world-z">0.0</span>m</label>
+              <input type="range" id="world-pos-z" min="-50" max="50" step="0.1" value="0" class="range-slider" />
+            </div>
+            <div class="adjust-row">
+              <label>回転 Y: <span id="val-world-roty">0</span>°</label>
+              <input type="range" id="world-rot-y" min="0" max="360" step="1" value="0" class="range-slider" />
+            </div>
+            <div class="adjust-row">
+              <label>スケール: <span id="val-world-scale">1.0</span>倍</label>
+              <input type="range" id="world-scale" min="0.01" max="10" step="0.01" value="1.0" class="range-slider" />
+            </div>
+          </div>
+
+          <!-- Sun and Time Panel -->
+          <div class="control-group sun-panel" style="border-top: 1px solid var(--glass-border); padding-top: 1rem;">
+            <p class="section-title">☀️ 太陽と時間の設定</p>
+            <div class="adjust-row">
+              <label>現在の時間 (角度): <span id="val-sun-time">45</span>°</label>
+              <input type="range" id="sun-time" min="0" max="360" step="1" value="45" class="range-slider" />
+            </div>
+            <div class="adjust-row">
+              <label>時間の進む速度: <span id="val-sun-speed">1.0</span>倍</label>
+              <input type="range" id="sun-speed" min="0" max="5" step="0.1" value="1.0" class="range-slider" />
+            </div>
+            <div class="adjust-row" style="flex-direction: row; justify-content: space-between; align-items: center; margin-top: 0.2rem;">
+              <label style="margin: 0; line-height: 28px;">太陽の光の色:</label>
+              <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <input type="color" id="sun-color" value="#ffffff" style="border: 1px solid var(--glass-border); width: 45px; height: 28px; cursor: pointer; border-radius: 6px; background: none; padding: 0;" />
+                <button id="reset-sun-color" class="action-btn" style="padding: 2px 8px; font-size: 0.75rem; width: auto; margin: 0; background: rgba(255,255,255,0.08);">リセット</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Multiplayer Network Panel -->
+          <div class="control-group network-panel">
+            <p class="section-title">🌐 マルチプレイヤー</p>
+            <div class="network-row">
+              <input type="text" id="room-name" placeholder="ルーム名" value="CHAT" class="name-input" maxlength="30" />
+            </div>
+            <div class="network-row">
+              <input type="text" id="player-name" placeholder="プレイヤー名" class="name-input" maxlength="20" />
+            </div>
+            <button id="connect-btn" class="action-btn">🌐 サーバー接続</button>
+            <button id="qr-btn" class="action-btn" style="background:rgba(108,142,255,0.15);border-color:rgba(108,142,255,0.3);">📱 スマホで接続 (QR)</button>
+            <p id="network-status" class="status-text" style="color:#ff6c8e;">🔴 未接続</p>
+            <p style="font-size:0.65rem;color:#666;margin-top:4px;">同じルーム名の人同士が同じ空間に入れます</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toggle Panel Button -->
+      <button id="panel-toggle" class="panel-toggle-btn">⚙️ メニューを閉じる</button>
+
+      <!-- QR Code Modal -->
+      <div id="qr-modal" class="modal-overlay">
+        <div class="modal-content">
+          <h3>📱 スマホ外部接続</h3>
+          <p style="font-size:0.85rem;color:var(--text-muted);">スマホと同じWi-Fiに接続した状態で、カメラで以下のQRコードを読み取ってください。</p>
+          <div class="qr-container">
+            <img id="qr-image" src="" alt="QR Code" />
+          </div>
+          <div id="qr-url-text" class="ip-text">取得中...</div>
+          <button id="modal-close" class="close-btn">閉じる</button>
+        </div>
+      </div>
+
+
+      
+      <div id="loading-overlay" class="hidden">
+        <div class="spinner"></div>
+        <p>読み込み中...</p>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
