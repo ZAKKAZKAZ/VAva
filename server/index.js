@@ -14,13 +14,25 @@ const io = new Server(server, {
 const rooms = new Map();
 
 function getRoom(roomName) {
-  if (!rooms.has(roomName)) rooms.set(roomName, new Map());
-  return rooms.get(roomName);
+  if (!rooms.has(roomName)) {
+    rooms.set(roomName, {
+      players: new Map(),
+      environment: {
+        worldData: null,
+        worldTransform: null,
+        skyboxData: null,
+        sunSettings: null,
+      }
+    });
+  }
+  return rooms.get(roomName).players;
 }
 
 function cleanupRoom(roomName) {
-  const room = rooms.get(roomName);
-  if (room && room.size === 0) rooms.delete(roomName);
+  const roomObj = rooms.get(roomName);
+  if (roomObj && roomObj.players.size === 0) {
+    rooms.delete(roomName);
+  }
 }
 
 io.on('connection', (socket) => {
@@ -56,12 +68,12 @@ io.on('connection', (socket) => {
 
     console.log(`[Room:${currentRoom}] ${name || id} joined (${roomPlayers.size} players)`);
 
-    // ルーム情報をクライアントに返す (ワールドのトランスフォームがあればそれも同封)
+    // ルーム情報をクライアントに返す (ワールドモデルや太陽設定などの環境情報も同封)
     const roomObj = rooms.get(currentRoom);
     socket.emit('room-joined', { 
       room: currentRoom, 
       playerCount: roomPlayers.size,
-      worldTransform: roomObj ? roomObj.worldTransform : null
+      environment: roomObj ? roomObj.environment : null
     });
   });
 
@@ -81,9 +93,39 @@ io.on('connection', (socket) => {
     if (!currentRoom) return;
     const roomObj = rooms.get(currentRoom);
     if (roomObj) {
-      roomObj.worldTransform = data;
+      roomObj.environment.worldTransform = data;
     }
     socket.to(currentRoom).emit('world-transformed', data);
+  });
+
+  // ワールド3Dモデルデータの共有と保存
+  socket.on('world-share', (data) => {
+    if (!currentRoom) return;
+    const roomObj = rooms.get(currentRoom);
+    if (roomObj) {
+      roomObj.environment.worldData = data;
+    }
+    socket.to(currentRoom).emit('world-shared', data);
+  });
+
+  // スカイボックス背景画像の共有と保存
+  socket.on('skybox-share', (data) => {
+    if (!currentRoom) return;
+    const roomObj = rooms.get(currentRoom);
+    if (roomObj) {
+      roomObj.environment.skyboxData = data;
+    }
+    socket.to(currentRoom).emit('skybox-shared', data);
+  });
+
+  // 太陽と時間のパラメータ設定の共有と保存
+  socket.on('sun-settings-share', (data) => {
+    if (!currentRoom) return;
+    const roomObj = rooms.get(currentRoom);
+    if (roomObj) {
+      roomObj.environment.sunSettings = data;
+    }
+    socket.to(currentRoom).emit('sun-settings-shared', data);
   });
   // テキストチャットの仲介
   socket.on('chat-msg', (text) => {

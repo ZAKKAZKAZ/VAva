@@ -309,24 +309,40 @@ function init() {
   const valSunTime = document.getElementById('val-sun-time') as HTMLSpanElement;
   const valSunSpeed = document.getElementById('val-sun-speed') as HTMLSpanElement;
 
+  // 太陽と時間の変更をサーバーに通知する共通関数
+  function shareSunSettings() {
+    if (socket && socket.connected) {
+      socket.emit('sun-settings-share', {
+        timeAngle: sunTimeAngle,
+        speedFactor: sunSpeedFactor,
+        isCustomColor: isCustomSunColor,
+        colorHex: sunColorPicker.value
+      });
+    }
+  }
+
   sunTimeSlider.addEventListener('input', () => {
     sunTimeAngle = parseFloat(sunTimeSlider.value);
     valSunTime.textContent = sunTimeSlider.value;
+    shareSunSettings();
   });
 
   sunSpeedSlider.addEventListener('input', () => {
     sunSpeedFactor = parseFloat(sunSpeedSlider.value);
     valSunSpeed.textContent = sunSpeedFactor.toFixed(1);
+    shareSunSettings();
   });
 
   sunColorPicker.addEventListener('input', () => {
     customSunColor.set(sunColorPicker.value);
     isCustomSunColor = true;
+    shareSunSettings();
   });
 
   resetSunColorBtn.addEventListener('click', () => {
     isCustomSunColor = false;
     sunColorPicker.value = '#ffffff';
+    shareSunSettings();
   });
 
   // Avatar selector UI wiring
@@ -1220,6 +1236,31 @@ function applyRemotePlayerState(rp: RemotePlayerObj, state: RemotePlayerState) {
   }
 }
 
+function applySunSettings(data: { timeAngle: number; speedFactor: number; isCustomColor: boolean; colorHex: string }) {
+  sunTimeAngle = data.timeAngle;
+  sunSpeedFactor = data.speedFactor;
+  isCustomSunColor = data.isCustomColor;
+  
+  const sunTimeSlider = document.getElementById('sun-time') as HTMLInputElement;
+  const sunSpeedSlider = document.getElementById('sun-speed') as HTMLInputElement;
+  const sunColorPicker = document.getElementById('sun-color') as HTMLInputElement;
+  
+  const valSunTime = document.getElementById('val-sun-time') as HTMLSpanElement;
+  const valSunSpeed = document.getElementById('val-sun-speed') as HTMLSpanElement;
+
+  if (sunTimeSlider) { sunTimeSlider.value = data.timeAngle.toString(); }
+  if (valSunTime) { valSunTime.textContent = data.timeAngle.toString(); }
+  if (sunSpeedSlider) { sunSpeedSlider.value = data.speedFactor.toString(); }
+  if (valSunSpeed) { valSunSpeed.textContent = data.speedFactor.toFixed(1); }
+  
+  if (data.isCustomColor) {
+    customSunColor.set(data.colorHex);
+    if (sunColorPicker) { sunColorPicker.value = data.colorHex; }
+  } else {
+    if (sunColorPicker) { sunColorPicker.value = '#ffffff'; }
+  }
+}
+
 function removeRemotePlayer(id: string) {
   const rp = remotePlayers.get(id);
   if (rp) {
@@ -1279,12 +1320,9 @@ function initNetwork() {
     if (worldScale) { worldScale.value = data.s.toString(); valWorldScale.textContent = data.s.toFixed(2); }
   }
 
-  socket.on('room-joined', ({ room, playerCount, worldTransform }: { room: string; playerCount: number; worldTransform?: any }) => {
+  socket.on('room-joined', ({ room, playerCount, environment }: { room: string; playerCount: number; environment?: any }) => {
     updateNetworkStatus(true, room, playerCount);
     console.log(`[Network] Joined room: ${room} (${playerCount} players)`);
-    if (worldTransform) {
-      applyWorldTransform(worldTransform);
-    }
 
     // Show chat area and mic button
     const chatContainer = document.getElementById('chat-container');
@@ -1292,6 +1330,56 @@ function initNetwork() {
     if (chatContainer) chatContainer.style.display = 'flex';
     if (micBtn) micBtn.style.display = 'block';
     appendChatMessage('システム', `🟢 ルーム [${room}] に接続しました。`, true);
+
+    // Apply environment if it exists (meaning a host has already loaded something)
+    if (environment) {
+      // 1. Apply world transform
+      if (environment.worldTransform) {
+        applyWorldTransform(environment.worldTransform);
+      }
+      
+      // 2. Apply sun settings
+      if (environment.sunSettings) {
+        applySunSettings(environment.sunSettings);
+      }
+
+      // 3. Load world model
+      if (environment.worldData) {
+        const wd = environment.worldData;
+        console.log(`[Network] Loading host world: ${wd.fileName}`);
+        const blob = new Blob([wd.buffer], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        loadingOverlay.classList.remove('hidden');
+        statusDisplay.innerText = `ホストのワールド (${wd.fileName}) をロード中...`;
+        if (wd.type === 'glb') {
+          loadWorldGLTF(url);
+        } else {
+          loadWorldFBX(url);
+        }
+      }
+
+      // 4. Load skybox background
+      if (environment.skyboxData) {
+        const sd = environment.skyboxData;
+        console.log(`[Network] Loading host skybox: ${sd.fileName}`);
+        const blob = new Blob([sd.buffer], { type: 'image/png' });
+        const url = URL.createObjectURL(blob);
+        
+        const loader = new THREE.TextureLoader();
+        loader.load(url, (texture) => {
+          if (skyboxTexture) skyboxTexture.dispose();
+          skyboxTexture = texture;
+          skyboxTexture.mapping = THREE.EquirectangularReflectionMapping;
+          skyboxTexture.colorSpace = THREE.SRGBColorSpace;
+          scene.background = skyboxTexture;
+          scene.environment = skyboxTexture;
+          URL.revokeObjectURL(url);
+        }, undefined, (err) => {
+          console.error(err);
+          URL.revokeObjectURL(url);
+        });
+      }
+    }
   });
  
   socket.on('disconnect', () => {
@@ -1361,6 +1449,53 @@ function initNetwork() {
   // 他のプレイヤーがワールド調整（位置、回転、スケール）を操作した際に受け取る
   socket.on('world-transformed', (data: { x: number, y: number, z: number, rY: number, s: number }) => {
     applyWorldTransform(data);
+  });
+
+  // 他のプレイヤーからワールドモデルデータが共有された場合
+  socket.on('world-shared', ({ fileName, type, buffer }: { fileName: string; type: 'glb' | 'fbx'; buffer: ArrayBuffer }) => {
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    
+    loadingOverlay.classList.remove('hidden');
+    statusDisplay.innerText = `他プレイヤーのワールド (${fileName}) をロード中...`;
+    
+    if (type === 'glb') {
+      loadWorldGLTF(url);
+    } else {
+      loadWorldFBX(url);
+    }
+  });
+
+  // 他のプレイヤーからスカイボックス画像データが共有された場合
+  socket.on('skybox-shared', ({ fileName, buffer }: { fileName: string; buffer: ArrayBuffer }) => {
+    const blob = new Blob([buffer], { type: 'image/png' });
+    const url = URL.createObjectURL(blob);
+    
+    loadingOverlay.classList.remove('hidden');
+    statusDisplay.innerText = `他プレイヤーの背景画像 (${fileName}) をロード中...`;
+    
+    const loader = new THREE.TextureLoader();
+    loader.load(url, (texture) => {
+      if (skyboxTexture) skyboxTexture.dispose();
+      skyboxTexture = texture;
+      skyboxTexture.mapping = THREE.EquirectangularReflectionMapping;
+      skyboxTexture.colorSpace = THREE.SRGBColorSpace;
+      scene.background = skyboxTexture;
+      scene.environment = skyboxTexture;
+      
+      statusDisplay.innerText = '背景画像の同期が完了しました！';
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    }, undefined, (err) => {
+      console.error(err);
+      loadingOverlay.classList.add('hidden');
+      URL.revokeObjectURL(url);
+    });
+  });
+
+  // 他のプレイヤーから太陽と時間設定が変更された場合
+  socket.on('sun-settings-shared', (data: any) => {
+    applySunSettings(data);
   });
 
   // チャットメッセージを受信
@@ -1679,6 +1814,21 @@ function handleWorldUpload(event: Event) {
   loadingOverlay.classList.remove('hidden');
   statusDisplay.innerText = `${file.name} (ワールド) を読み込み中...`;
 
+  // Read world file as ArrayBuffer and share via Socket.io
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const arrayBuffer = e.target?.result as ArrayBuffer;
+    if (socket && socket.connected) {
+      console.log(`[Network] Sharing world model: ${file.name} (${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+      socket.emit('world-share', {
+        fileName: file.name,
+        type: extension === 'glb' || extension === 'gltf' ? 'glb' : 'fbx',
+        buffer: arrayBuffer
+      });
+    }
+  };
+  reader.readAsArrayBuffer(file);
+
   if (extension === 'glb' || extension === 'gltf') {
     loadWorldGLTF(url);
   } else if (extension === 'fbx') {
@@ -1859,6 +2009,20 @@ function handleSkyboxUpload(event: Event) {
   const url = URL.createObjectURL(file);
   loadingOverlay.classList.remove('hidden');
   statusDisplay.innerText = `${file.name} (背景画像) を読み込み中...`;
+
+  // Read skybox image as ArrayBuffer and share via Socket.io
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const arrayBuffer = e.target?.result as ArrayBuffer;
+    if (socket && socket.connected) {
+      console.log(`[Network] Sharing skybox: ${file.name} (${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+      socket.emit('skybox-share', {
+        fileName: file.name,
+        buffer: arrayBuffer
+      });
+    }
+  };
+  reader.readAsArrayBuffer(file);
 
   const loader = new THREE.TextureLoader();
   loader.load(
