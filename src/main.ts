@@ -80,6 +80,7 @@ let socket: Socket | null = null;
 const remotePlayers = new Map<string, RemotePlayerObj>();
 let localPlayerName = 'Player_' + Math.floor(Math.random() * 9000 + 1000);
 let localRoomName = 'CHAT';
+let localAvatarCache: { fileName: string; type: 'vrm' | 'fbx'; buffer: ArrayBuffer } | null = null;
 let lastNetworkSend = 0;
 const SEND_INTERVAL = 1000 / 20; // 20fps
 const PLAYER_COLORS = [
@@ -445,13 +446,16 @@ function handleFileUpload(event: Event) {
   const reader = new FileReader();
   reader.onload = (e) => {
     const arrayBuffer = e.target?.result as ArrayBuffer;
+    // Cache the uploaded avatar data locally
+    localAvatarCache = {
+      fileName: file.name,
+      type: extension === 'vrm' ? 'vrm' : 'fbx',
+      buffer: arrayBuffer
+    };
+    
     if (socket && socket.connected) {
       console.log(`[Network] Sharing avatar model: ${file.name} (${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
-      socket.emit('avatar-share', {
-        fileName: file.name,
-        type: extension === 'vrm' ? 'vrm' : 'fbx',
-        buffer: arrayBuffer
-      });
+      socket.emit('avatar-share', localAvatarCache);
     }
   };
   reader.readAsArrayBuffer(file);
@@ -1198,6 +1202,12 @@ function initNetwork() {
     console.log('[Network] Connected:', socket!.id);
     // 接続後すぐにルームに参加
     socket!.emit('join-room', { room: localRoomName, name: localPlayerName });
+
+    // Send cached avatar data immediately upon connection
+    if (localAvatarCache) {
+      console.log(`[Network] Connected. Auto-sharing cached avatar: ${localAvatarCache.fileName}`);
+      socket!.emit('avatar-share', localAvatarCache);
+    }
   });
 
   // ワールド調整値をローカルモデルとスライダーUIに適用するヘルパー関数

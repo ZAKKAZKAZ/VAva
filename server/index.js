@@ -7,6 +7,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
+  maxHttpBufferSize: 1e8, // Allow up to 100MB payloads (VRM/FBX files)
 });
 
 // roomName -> Map<socketId, PlayerState>
