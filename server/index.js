@@ -55,14 +55,41 @@ io.on('connection', (socket) => {
 
     console.log(`[Room:${currentRoom}] ${name || id} joined (${roomPlayers.size} players)`);
 
-    // ルーム情報をクライアントに返す
-    socket.emit('room-joined', { room: currentRoom, playerCount: roomPlayers.size });
+    // ルーム情報をクライアントに返す (ワールドのトランスフォームがあればそれも同封)
+    const roomObj = rooms.get(currentRoom);
+    socket.emit('room-joined', { 
+      room: currentRoom, 
+      playerCount: roomPlayers.size,
+      worldTransform: roomObj ? roomObj.worldTransform : null
+    });
   });
 
-  // 状態更新を受信 → 同じルームのみにブロードキャスト
+  // アバターの共有 (モデルデータをルーム内の他プレイヤーに転送しキャッシュする)
+  socket.on('avatar-share', (data) => {
+    if (!currentRoom) return;
+    const roomPlayers = getRoom(currentRoom);
+    const player = roomPlayers.get(id);
+    if (player) {
+      player.avatarData = data;
+    }
+    socket.to(currentRoom).emit('avatar-shared', { id, ...data });
+  });
+
+  // ワールドの位置調整（位置、回転、スケール）をルーム内の他の人に転送し、ルーム状態に保存する
+  socket.on('world-transform', (data) => {
+    if (!currentRoom) return;
+    const roomObj = rooms.get(currentRoom);
+    if (roomObj) {
+      roomObj.worldTransform = data;
+    }
+    socket.to(currentRoom).emit('world-transformed', data);
+  });
   socket.on('state', (data) => {
     if (!currentRoom) return;
-    getRoom(currentRoom).set(id, data);
+    const roomPlayers = getRoom(currentRoom);
+    const existing = roomPlayers.get(id) || {};
+    const updated = { ...existing, ...data };
+    roomPlayers.set(id, updated);
     socket.to(currentRoom).emit('player-state', { id, ...data });
   });
 

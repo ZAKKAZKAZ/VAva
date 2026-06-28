@@ -59,13 +59,22 @@ interface RemotePlayerState {
   position: { x: number; y: number; z: number };
   rotationY: number;
   boneRots: Record<string, { x: number; y: number; z: number }>;
+  avatarData?: {
+    fileName: string;
+    type: 'vrm' | 'fbx';
+    buffer: ArrayBuffer;
+  };
 }
 interface RemotePlayerObj {
   group: THREE.Group;
-  head: THREE.Mesh;
+  head: THREE.Object3D;
   targetPos: THREE.Vector3;
   targetRotY: number;
   nameSprite: THREE.Sprite;
+  vrm?: VRM;
+  fbx?: THREE.Group;
+  defaultVisuals?: THREE.Group;
+  mixer?: THREE.AnimationMixer;
 }
 let socket: Socket | null = null;
 const remotePlayers = new Map<string, RemotePlayerObj>();
@@ -268,6 +277,10 @@ function init() {
     valWorldZ.textContent = z.toFixed(1);
     valWorldRotY.textContent = worldRotY.value;
     valWorldScale.textContent = s.toFixed(2);
+
+    if (socket && socket.connected) {
+      socket.emit('world-transform', { x, y, z, rY, s });
+    }
   }
 
   worldPosX.addEventListener('input', updateWorldTransforms);
@@ -323,6 +336,21 @@ function handleFileUpload(event: Event) {
 
   loadingOverlay.classList.remove('hidden');
   statusDisplay.innerText = `${file.name} を読み込み中...`;
+
+  // Read model file as ArrayBuffer and share via Socket.io
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const arrayBuffer = e.target?.result as ArrayBuffer;
+    if (socket && socket.connected) {
+      console.log(`[Network] Sharing avatar model: ${file.name} (${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+      socket.emit('avatar-share', {
+        fileName: file.name,
+        type: extension === 'vrm' ? 'vrm' : 'fbx',
+        buffer: arrayBuffer
+      });
+    }
+  };
+  reader.readAsArrayBuffer(file);
 
   if (extension === 'vrm') {
     loadVRM(url, file.name);
@@ -820,6 +848,10 @@ function animate() {
       rp.group.rotation.y = THREE.MathUtils.lerp(rp.group.rotation.y, rp.targetRotY, 0.15);
       // Billboard name label toward camera
       rp.nameSprite.quaternion.copy(camera.quaternion);
+
+      if (rp.mixer) {
+        rp.mixer.update(delta);
+      }
     });
 
     // --- Send local state to server ---
@@ -885,44 +917,48 @@ function createRemotePlayerMesh(id: string, name: string): RemotePlayerObj {
   const mat      = new THREE.MeshLambertMaterial({ color });
   const group    = new THREE.Group();
 
+  const defaultVisuals = new THREE.Group();
+
   // Torso
   const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.15, 0.5, 4, 8), mat);
   torso.position.y = 0.9;
-  group.add(torso);
+  defaultVisuals.add(torso);
 
   // Head
   const headMesh = new THREE.Mesh(new THREE.SphereGeometry(0.16, 12, 8), mat);
   headMesh.position.y = 1.52;
-  group.add(headMesh);
+  defaultVisuals.add(headMesh);
 
   // Eyes (white dots)
   const eyeMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
   const lEye = new THREE.Mesh(new THREE.SphereGeometry(0.035, 6, 6), eyeMat);
   lEye.position.set(0.07, 1.55, 0.14);
-  group.add(lEye);
+  defaultVisuals.add(lEye);
   const rEye = new THREE.Mesh(new THREE.SphereGeometry(0.035, 6, 6), eyeMat);
   rEye.position.set(-0.07, 1.55, 0.14);
-  group.add(rEye);
+  defaultVisuals.add(rEye);
 
   // Arms
   const armGeo = new THREE.CapsuleGeometry(0.055, 0.38, 4, 8);
   const lArm   = new THREE.Mesh(armGeo, mat);
   lArm.position.set( 0.27, 1.0, 0);
   lArm.rotation.z = 0.35;
-  group.add(lArm);
+  defaultVisuals.add(lArm);
   const rArm = new THREE.Mesh(armGeo, mat);
   rArm.position.set(-0.27, 1.0, 0);
   rArm.rotation.z = -0.35;
-  group.add(rArm);
+  defaultVisuals.add(rArm);
 
   // Legs
   const legGeo = new THREE.CapsuleGeometry(0.07, 0.48, 4, 8);
   const lLeg   = new THREE.Mesh(legGeo, mat);
   lLeg.position.set( 0.1, 0.34, 0);
-  group.add(lLeg);
+  defaultVisuals.add(lLeg);
   const rLeg = new THREE.Mesh(legGeo, mat);
   rLeg.position.set(-0.1, 0.34, 0);
-  group.add(rLeg);
+  defaultVisuals.add(rLeg);
+
+  group.add(defaultVisuals);
 
   // Name label
   const nameSprite = createNameSprite(name || id.substring(0, 8), colorHex);
@@ -935,12 +971,102 @@ function createRemotePlayerMesh(id: string, name: string): RemotePlayerObj {
     group, head: headMesh, nameSprite,
     targetPos: new THREE.Vector3(),
     targetRotY: 0,
+    defaultVisuals
   };
+}
+
+function setupRemotePlayerAvatar(rp: RemotePlayerObj, avatarData: NonNullable<RemotePlayerState['avatarData']>) {
+  if (rp.vrm) {
+    rp.group.remove(rp.vrm.scene);
+    rp.vrm = undefined;
+  }
+  if (rp.fbx) {
+    rp.group.remove(rp.fbx);
+    rp.fbx = undefined;
+    rp.mixer = undefined;
+  }
+
+  // Create Blob URL from the received ArrayBuffer
+  const blob = new Blob([avatarData.buffer], { type: 'application/octet-stream' });
+  const blobUrl = URL.createObjectURL(blob);
+
+  if (avatarData.type === 'vrm') {
+    const loader = new GLTFLoader();
+    loader.register((parser) => new VRMLoaderPlugin(parser));
+    loader.load(blobUrl, (gltf) => {
+      const vrm = gltf.userData.vrm as VRM;
+      vrm.scene.traverse((obj) => {
+        obj.frustumCulled = false;
+        if ((obj as THREE.Mesh).isMesh) {
+          obj.castShadow = true;
+          obj.receiveShadow = true;
+        }
+      });
+      
+      if (rp.defaultVisuals) rp.defaultVisuals.visible = false;
+
+      rp.vrm = vrm;
+      rp.group.add(vrm.scene);
+
+      // Height adjustment for nameplate
+      const head = vrm.humanoid.getNormalizedBoneNode('head');
+      const headPos = head ? head.position.y : 1.5;
+      rp.nameSprite.position.y = headPos + 0.45;
+
+      URL.revokeObjectURL(blobUrl);
+    }, undefined, (err) => {
+      console.error("[Network] Failed to load remote VRM", err);
+      URL.revokeObjectURL(blobUrl);
+    });
+  } else if (avatarData.type === 'fbx') {
+    const loader = new FBXLoader();
+    loader.load(blobUrl, (object) => {
+      object.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+        }
+      });
+      object.scale.set(0.01, 0.01, 0.01);
+
+      if (rp.defaultVisuals) rp.defaultVisuals.visible = false;
+
+      rp.fbx = object;
+      rp.group.add(object);
+
+      if (object.animations && object.animations.length > 0) {
+        rp.mixer = new THREE.AnimationMixer(object);
+        const action = rp.mixer.clipAction(object.animations[0]);
+        action.play();
+      }
+
+      rp.nameSprite.position.y = 1.95;
+      URL.revokeObjectURL(blobUrl);
+    }, undefined, (err) => {
+      console.error("[Network] Failed to load remote FBX", err);
+      URL.revokeObjectURL(blobUrl);
+    });
+  }
 }
 
 function applyRemotePlayerState(rp: RemotePlayerObj, state: RemotePlayerState) {
   rp.targetPos.set(state.position.x, state.position.y, state.position.z);
   rp.targetRotY = state.rotationY;
+
+  // Apply VRM bone rotations if model is loaded and we have bone updates
+  if (rp.vrm && state.boneRots) {
+    for (const [boneName, rot] of Object.entries(state.boneRots)) {
+      const bone = rp.vrm.humanoid.getNormalizedBoneNode(boneName as any);
+      if (bone) {
+        bone.rotation.set(rot.x, rot.y, rot.z);
+      }
+    }
+  }
+
+  // If this state contains avatar data and we haven't loaded it yet
+  if (state.avatarData && !rp.vrm && !rp.fbx) {
+    setupRemotePlayerAvatar(rp, state.avatarData);
+  }
 }
 
 function removeRemotePlayer(id: string) {
@@ -970,9 +1096,38 @@ function initNetwork() {
     socket!.emit('join-room', { room: localRoomName, name: localPlayerName });
   });
 
-  socket.on('room-joined', ({ room, playerCount }: { room: string; playerCount: number }) => {
+  // ワールド調整値をローカルモデルとスライダーUIに適用するヘルパー関数
+  function applyWorldTransform(data: { x: number, y: number, z: number, rY: number, s: number }) {
+    if (!currentWorld) return;
+    currentWorld.position.set(data.x, data.y, data.z);
+    currentWorld.rotation.y = data.rY;
+    currentWorld.scale.setScalar(data.s);
+
+    const worldPosX = document.getElementById('world-pos-x') as HTMLInputElement;
+    const worldPosY = document.getElementById('world-pos-y') as HTMLInputElement;
+    const worldPosZ = document.getElementById('world-pos-z') as HTMLInputElement;
+    const worldRotY = document.getElementById('world-rot-y') as HTMLInputElement;
+    const worldScale = document.getElementById('world-scale') as HTMLInputElement;
+
+    const valWorldX = document.getElementById('val-world-x') as HTMLSpanElement;
+    const valWorldY = document.getElementById('val-world-y') as HTMLSpanElement;
+    const valWorldZ = document.getElementById('val-world-z') as HTMLSpanElement;
+    const valWorldRotY = document.getElementById('val-world-roty') as HTMLSpanElement;
+    const valWorldScale = document.getElementById('val-world-scale') as HTMLSpanElement;
+
+    if (worldPosX) { worldPosX.value = data.x.toString(); valWorldX.textContent = data.x.toFixed(1); }
+    if (worldPosY) { worldPosY.value = data.y.toString(); valWorldY.textContent = data.y.toFixed(1); }
+    if (worldPosZ) { worldPosZ.value = data.z.toString(); valWorldZ.textContent = data.z.toFixed(1); }
+    if (worldRotY) { worldRotY.value = Math.round(THREE.MathUtils.radToDeg(data.rY)).toString(); valWorldRotY.textContent = worldRotY.value; }
+    if (worldScale) { worldScale.value = data.s.toString(); valWorldScale.textContent = data.s.toFixed(2); }
+  }
+
+  socket.on('room-joined', ({ room, playerCount, worldTransform }: { room: string; playerCount: number; worldTransform?: any }) => {
     updateNetworkStatus(true, room, playerCount);
     console.log(`[Network] Joined room: ${room} (${playerCount} players)`);
+    if (worldTransform) {
+      applyWorldTransform(worldTransform);
+    }
   });
 
   socket.on('disconnect', () => {
@@ -1009,6 +1164,21 @@ function initNetwork() {
   // 退出
   socket.on('player-left', ({ id }: { id: string }) => {
     removeRemotePlayer(id);
+  });
+
+  // 他プレイヤーからアバターデータが共有された場合
+  socket.on('avatar-shared', ({ id, fileName, type, buffer }: { id: string } & NonNullable<RemotePlayerState['avatarData']>) => {
+    let rp = remotePlayers.get(id);
+    if (!rp) {
+      rp = createRemotePlayerMesh(id, id.substring(0, 8));
+      remotePlayers.set(id, rp);
+    }
+    setupRemotePlayerAvatar(rp, { fileName, type, buffer });
+  });
+
+  // 他のプレイヤーがワールド調整（位置、回転、スケール）を操作した際に受け取る
+  socket.on('world-transformed', (data: { x: number, y: number, z: number, rY: number, s: number }) => {
+    applyWorldTransform(data);
   });
 }
 
