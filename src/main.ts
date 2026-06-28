@@ -323,6 +323,110 @@ function init() {
   avatarSelect.addEventListener('change', () => {
     switchActiveAvatar(parseInt(avatarSelect.value));
   });
+
+  // --- Mobile Virtual Joystick & Jump Button Setup ---
+  const mobileControls = document.getElementById('mobile-controls') as HTMLDivElement;
+  const joystickZone = document.getElementById('joystick-zone') as HTMLDivElement;
+  const joystickKnob = document.getElementById('joystick-knob') as HTMLDivElement;
+  const mobileJumpBtn = document.getElementById('mobile-jump-btn') as HTMLButtonElement;
+
+  // Show mobile controls if a touch event is detected
+  const showMobileControls = () => {
+    if (mobileControls) {
+      mobileControls.style.display = 'flex';
+    }
+  };
+  window.addEventListener('touchstart', showMobileControls, { once: true });
+
+  let joystickActive = false;
+  let startX = 0;
+  let startY = 0;
+  const maxDragDistance = 45; // Max radius to drag the joystick knob in pixels
+
+  if (joystickZone && joystickKnob) {
+    const handleJoystickStart = (clientX: number, clientY: number) => {
+      joystickActive = true;
+      const rect = joystickZone.getBoundingClientRect();
+      startX = rect.left + rect.width / 2;
+      startY = rect.top + rect.height / 2;
+    };
+
+    const handleJoystickMove = (clientX: number, clientY: number) => {
+      if (!joystickActive) return;
+
+      let deltaX = clientX - startX;
+      let deltaY = clientY - startY;
+      const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+
+      if (distance > maxDragDistance) {
+        deltaX = (deltaX / distance) * maxDragDistance;
+        deltaY = (deltaY / distance) * maxDragDistance;
+      }
+
+      // Visually move the knob
+      joystickKnob.style.transform = `translate(${deltaX}px, ${deltaY}px)`;
+
+      // Map drag to normalized keys (-1.0 to 1.0)
+      const normX = deltaX / maxDragDistance;
+      const normY = deltaY / maxDragDistance;
+
+      const threshold = 0.35;
+      keys.w = normY < -threshold;
+      keys.s = normY > threshold;
+      keys.a = normX < -threshold;
+      keys.d = normX > threshold;
+    };
+
+    const handleJoystickEnd = () => {
+      joystickActive = false;
+      joystickKnob.style.transform = 'translate(0px, 0px)';
+      keys.w = false;
+      keys.s = false;
+      keys.a = false;
+      keys.d = false;
+    };
+
+    // Touch listeners
+    joystickZone.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      const touch = e.touches[0];
+      handleJoystickStart(touch.clientX, touch.clientY);
+    }, { passive: false });
+
+    window.addEventListener('touchmove', (e) => {
+      if (!joystickActive) return;
+      const touch = e.touches[0];
+      handleJoystickMove(touch.clientX, touch.clientY);
+    }, { passive: false });
+
+    window.addEventListener('touchend', handleJoystickEnd);
+
+    // Mouse listeners for local testing / hybrid devices
+    joystickZone.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      handleJoystickStart(e.clientX, e.clientY);
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (joystickActive) {
+        handleJoystickMove(e.clientX, e.clientY);
+      }
+    });
+
+    window.addEventListener('mouseup', handleJoystickEnd);
+  }
+
+  if (mobileJumpBtn) {
+    const triggerJump = (e: Event) => {
+      e.preventDefault();
+      if (!isJumping) {
+        jumpVelocity = 7.0;
+        isJumping = true;
+      }
+    };
+    mobileJumpBtn.addEventListener('touchstart', triggerJump, { passive: false });
+    mobileJumpBtn.addEventListener('mousedown', triggerJump);
+  }
 }
 
 

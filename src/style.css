@@ -428,3 +428,91 @@ input[type="checkbox"] {
   transform: scale(1.2);
 }
 
+/* --- Mobile Touch Controls --- */
+.mobile-controls-wrapper {
+  position: absolute;
+  bottom: 40px;
+  left: 0;
+  right: 0;
+  height: 150px;
+  pointer-events: none;
+  z-index: 90;
+  display: none; /* JS will show this if touch is detected */
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 50px;
+}
+
+.joystick-container {
+  width: 120px;
+  height: 120px;
+  position: relative;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.joystick-base {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+}
+
+.joystick-knob {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #6c8eff 0%, #a5b4fc 100%);
+  border: 2px solid #ffffff;
+  box-shadow: 0 4px 15px rgba(108, 142, 255, 0.4);
+  position: absolute;
+  touch-action: none;
+  cursor: pointer;
+  /* Centered by default */
+  left: calc(50% - 27px);
+  top: calc(50% - 27px);
+}
+
+.mobile-jump-btn {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #ff6c8e 0%, #ff8da1 100%);
+  border: 2px solid #ffffff;
+  color: white;
+  font-weight: 800;
+  font-size: 1rem;
+  font-family: 'Outfit', sans-serif;
+  box-shadow: 0 8px 24px rgba(255, 108, 142, 0.35);
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+
+.mobile-jump-btn:active {
+  transform: scale(0.92);
+  box-shadow: 0 4px 12px rgba(255, 108, 142, 0.2);
+}
+
+/* Media query to optimize layout on small screens */
+@media (max-width: 768px) {
+  .mobile-controls-wrapper {
+    bottom: 25px;
+    padding: 0 30px;
+  }
+}
+
+
