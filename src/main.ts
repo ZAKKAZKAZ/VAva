@@ -662,14 +662,14 @@ function handleFileUpload(event: Event) {
     // Cache the uploaded avatar data locally
     localAvatarCache = {
       fileName: file.name,
-      type: extension === 'vrm' ? 'vrm' : 'fbx',
+      type: extension === 'fbx' ? 'fbx' : 'vrm',
       buffer: arrayBuffer
     };
     
     // Save to IndexedDB so it's remembered next time
     avatarDB.set('my_avatar', arrayBuffer).then(() => {
       localStorage.setItem('my_avatar_filename', file.name);
-      localStorage.setItem('my_avatar_type', extension === 'vrm' ? 'vrm' : 'fbx');
+      localStorage.setItem('my_avatar_type', extension === 'fbx' ? 'fbx' : 'vrm');
     });
     
     if (socket && socket.connected) {
@@ -679,14 +679,11 @@ function handleFileUpload(event: Event) {
   };
   reader.readAsArrayBuffer(file);
 
-  if (extension === 'vrm') {
-    loadVRM(url, file.name);
-  } else if (extension === 'fbx') {
+  if (extension === 'fbx') {
     loadFBX(url, file.name);
   } else {
-    statusDisplay.innerText = '未対応のファイル形式です。';
-    loadingOverlay.classList.add('hidden');
-    URL.revokeObjectURL(url);
+    // Default to VRM if extension is 'vrm' or unknown (iOS sometimes drops extensions)
+    loadVRM(url, file.name);
   }
 }
 

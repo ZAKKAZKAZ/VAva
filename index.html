@@ -31,7 +31,7 @@
           <div class="control-group">
             <label for="model-upload" class="upload-btn">
               <span>👤 アバターを読み込む (VRM/FBX)</span>
-              <input type="file" id="model-upload" accept=".vrm,.fbx,*/*" style="display: none;" />
+              <input type="file" id="model-upload" accept=".vrm,.fbx,*/*" class="hidden-file-input" />
             </label>
           </div>
 
@@ -47,21 +47,21 @@
           <div class="control-group">
             <label for="world-upload" class="upload-btn" style="background: linear-gradient(135deg, #ff6c8e, #ff8c6c); color: white;">
               <span>🗺️ ワールドを読み込む (GLB/GLTF/FBX)</span>
-              <input type="file" id="world-upload" accept=".glb,.gltf,.fbx,*/*" style="display: none;" />
+              <input type="file" id="world-upload" accept=".glb,.gltf,.fbx,*/*" class="hidden-file-input" />
             </label>
           </div>
 
           <div class="control-group">
             <label for="skybox-upload" class="upload-btn" style="background: linear-gradient(135deg, #6a11cb, #2575fc); color: white;">
               <span>🌌 背景を読み込む (パノラマ画像)</span>
-              <input type="file" id="skybox-upload" accept="image/*" style="display: none;" />
+              <input type="file" id="skybox-upload" accept="image/*" class="hidden-file-input" />
             </label>
           </div>
 
           <div class="control-group" style="padding-bottom: 0.5rem;">
             <label for="bgm-upload" class="upload-btn" style="background: linear-gradient(135deg, #11cb8f, #25fcbe); color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,0.3);">
               <span>🎵 BGMを読み込む (MP3/WAV)</span>
-              <input type="file" id="bgm-upload" accept="audio/*" style="display: none;" />
+              <input type="file" id="bgm-upload" accept="audio/*" class="hidden-file-input" />
             </label>
             <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 0.5rem; padding: 0 0.5rem;">
               <label style="font-size: 0.75rem; color: var(--text-muted); margin: 0;">BGM音量:</label>
