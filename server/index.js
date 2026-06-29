@@ -41,7 +41,7 @@ io.on('connection', (socket) => {
   console.log(`[+] Connected: ${id}`);
 
   // ルームに参加
-  socket.on('join-room', ({ room, name }) => {
+  socket.on('join-room', ({ room, name, playerId }) => {
     // 以前のルームから退出
     if (currentRoom) {
       const prevRoom = getRoom(currentRoom);
@@ -54,6 +54,16 @@ io.on('connection', (socket) => {
     currentRoom = room || 'default';
     socket.join(currentRoom);
     const roomPlayers = getRoom(currentRoom);
+
+    // 同じplayerId（同一ブラウザの古い接続）が残っていれば強制削除（ゴースト防止）
+    if (playerId) {
+      for (const [pid, pstate] of roomPlayers.entries()) {
+        if (pstate.playerId === playerId && pid !== id) {
+          roomPlayers.delete(pid);
+          io.to(currentRoom).emit('player-left', { id: pid });
+        }
+      }
+    }
 
     // 既存メンバー一覧を新規参加者に送る (Bufferは除外してメタデータのみ送る)
     const existing = [];
@@ -68,7 +78,7 @@ io.on('connection', (socket) => {
     socket.emit('init', existing);
 
     // 初期状態を登録
-    roomPlayers.set(id, { name: name || id.substring(0, 8), position: { x: 0, y: 0, z: 0 }, rotationY: 0, boneRots: {} });
+    roomPlayers.set(id, { playerId: playerId, name: name || id.substring(0, 8), position: { x: 0, y: 0, z: 0 }, rotationY: 0, boneRots: {} });
 
     // 他のメンバーに参加を通知
     socket.to(currentRoom).emit('player-joined', { id, name: name || id.substring(0, 8) });

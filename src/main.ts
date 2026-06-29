@@ -83,6 +83,11 @@ let socket: Socket | null = null;
 const remotePlayers = new Map<string, RemotePlayerObj>();
 let localPlayerName = localStorage.getItem('localPlayerName') || ('Player_' + Math.floor(Math.random() * 9000 + 1000));
 let localRoomName = localStorage.getItem('localRoomName') || 'CHAT';
+let localPlayerId = localStorage.getItem('localPlayerId');
+if (!localPlayerId) {
+  localPlayerId = Math.random().toString(36).substring(2, 15);
+  localStorage.setItem('localPlayerId', localPlayerId);
+}
 let localAvatarCache: { fileName: string; type: 'vrm' | 'fbx'; buffer: ArrayBuffer } | null = null;
 
 // IndexedDB Avatar Cache
@@ -211,6 +216,13 @@ function init() {
   window.addEventListener('resize', onWindowResize);
   document.addEventListener('mousemove', onMouseMove);
   document.addEventListener('click', onClick);
+  
+  // Clean disconnect on page reload/close to prevent ghost avatars
+  window.addEventListener('beforeunload', () => {
+    if (socket && socket.connected) {
+      socket.disconnect();
+    }
+  });
   
   // Keyboard Listeners
   window.addEventListener('keydown', onKeyDown);
@@ -1466,7 +1478,7 @@ function initNetwork() {
   socket.on('connect', () => {
     console.log('[Network] Connected:', socket!.id);
     // 接続後すぐにルームに参加
-    socket!.emit('join-room', { room: localRoomName, name: localPlayerName });
+    socket!.emit('join-room', { room: localRoomName, name: localPlayerName, playerId: localPlayerId });
 
     // Send cached avatar data immediately upon connection
     if (localAvatarCache) {
@@ -1554,7 +1566,40 @@ function initNetwork() {
         } else {
           loadWorldFBX(url);
         }
+      } else {
+        // Room has no world, share our cached world if we have one
+        const savedWorldName = localStorage.getItem('my_world_filename');
+        const savedWorldType = localStorage.getItem('my_world_type');
+        if (savedWorldName && savedWorldType) {
+          avatarDB.get('my_world').then(buffer => {
+            if (buffer && socket && socket.connected) {
+              console.log(`[Network] Auto-sharing cached world: ${savedWorldName}`);
+              socket.emit('world-share', {
+                fileName: savedWorldName,
+                type: savedWorldType,
+                buffer: buffer
+              });
+            }
+          });
+        }
       }
+    } else {
+      // No environment at all, share our cached world if we have one
+      const savedWorldName = localStorage.getItem('my_world_filename');
+      const savedWorldType = localStorage.getItem('my_world_type');
+      if (savedWorldName && savedWorldType) {
+        avatarDB.get('my_world').then(buffer => {
+          if (buffer && socket && socket.connected) {
+            console.log(`[Network] Auto-sharing cached world: ${savedWorldName}`);
+            socket.emit('world-share', {
+              fileName: savedWorldName,
+              type: savedWorldType,
+              buffer: buffer
+            });
+          }
+        });
+      }
+    }
 
       // 4. Load skybox background
       if (environment.skyboxData) {
