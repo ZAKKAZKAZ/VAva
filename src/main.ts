@@ -1444,8 +1444,22 @@ function applyRemotePlayerState(rp: RemotePlayerObj, state: RemotePlayerState) {
 
   // Apply VRM bone rotations if model is loaded and we have bone updates
   if (rp.vrm && state.boneRots) {
+    const VrmBoneMap: Record<string, string> = {
+      lUpperArm: 'leftUpperArm',
+      rUpperArm: 'rightUpperArm',
+      lLowerArm: 'leftLowerArm',
+      rLowerArm: 'rightLowerArm',
+      lUpperLeg: 'leftUpperLeg',
+      rUpperLeg: 'rightUpperLeg',
+      lLowerLeg: 'leftLowerLeg',
+      rLowerLeg: 'rightLowerLeg',
+      spine: 'spine',
+      chest: 'chest',
+      hips: 'hips',
+    };
     for (const [boneName, rot] of Object.entries(state.boneRots)) {
-      const bone = rp.vrm.humanoid.getNormalizedBoneNode(boneName as any);
+      const vrmBoneName = VrmBoneMap[boneName] || boneName;
+      const bone = rp.vrm.humanoid.getNormalizedBoneNode(vrmBoneName as any);
       if (bone) {
         bone.rotation.set(rot.x, rot.y, rot.z);
       }
