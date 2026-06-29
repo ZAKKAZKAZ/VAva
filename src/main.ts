@@ -2502,11 +2502,13 @@ function playBgmFromBuffer(buffer: ArrayBuffer, type: string) {
       statusDisplay.innerText = "BGM再生のため画面内をクリックしてください";
       
       const playOnInteraction = () => {
-        bgmPlayer.play();
+        bgmPlayer.play().catch(()=>{});
         document.removeEventListener('click', playOnInteraction);
+        document.removeEventListener('touchstart', playOnInteraction);
         statusDisplay.innerText = "準備完了";
       };
       document.addEventListener('click', playOnInteraction);
+      document.addEventListener('touchstart', playOnInteraction, { passive: true });
     });
   }
 }
