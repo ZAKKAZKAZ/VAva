@@ -29,10 +29,10 @@ function getRoom(roomName) {
 }
 
 function cleanupRoom(roomName) {
-  const roomObj = rooms.get(roomName);
-  if (roomObj && roomObj.players.size === 0) {
-    rooms.delete(roomName);
-  }
+  // const roomObj = rooms.get(roomName);
+  // if (roomObj && roomObj.players.size === 0) {
+  //   rooms.delete(roomName); // 一度アップロードしたワールドを維持するために、ルームを削除せず残す
+  // }
 }
 
 io.on('connection', (socket) => {

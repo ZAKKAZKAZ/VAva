@@ -81,8 +81,8 @@ interface RemotePlayerObj {
 }
 let socket: Socket | null = null;
 const remotePlayers = new Map<string, RemotePlayerObj>();
-let localPlayerName = 'Player_' + Math.floor(Math.random() * 9000 + 1000);
-let localRoomName = 'CHAT';
+let localPlayerName = localStorage.getItem('localPlayerName') || ('Player_' + Math.floor(Math.random() * 9000 + 1000));
+let localRoomName = localStorage.getItem('localRoomName') || 'CHAT';
 let localAvatarCache: { fileName: string; type: 'vrm' | 'fbx'; buffer: ArrayBuffer } | null = null;
 
 // IndexedDB Avatar Cache
@@ -253,8 +253,14 @@ function init() {
   const roomInput  = document.getElementById('room-name') as HTMLInputElement;
   nameInput.value  = localPlayerName;
   roomInput.value  = localRoomName;
-  nameInput.addEventListener('change', () => { localPlayerName = nameInput.value.trim() || localPlayerName; });
-  roomInput.addEventListener('change', () => { localRoomName = roomInput.value.trim() || 'CHAT'; });
+  nameInput.addEventListener('change', () => { 
+    localPlayerName = nameInput.value.trim() || localPlayerName; 
+    localStorage.setItem('localPlayerName', localPlayerName);
+  });
+  roomInput.addEventListener('change', () => { 
+    localRoomName = roomInput.value.trim() || 'CHAT'; 
+    localStorage.setItem('localRoomName', localRoomName);
+  });
   connectBtn.addEventListener('click', () => {
     if (socket && socket.connected) {
       disconnectNetwork();
@@ -546,6 +552,44 @@ function init() {
   if (micBtn) {
     micBtn.addEventListener('click', toggleMic);
   }
+
+  // --- Restore Cached Local Avatar and World ---
+  const savedAvatarName = localStorage.getItem('my_avatar_filename');
+  const savedAvatarType = localStorage.getItem('my_avatar_type');
+  if (savedAvatarName && savedAvatarType) {
+    avatarDB.get('my_avatar').then(buffer => {
+      if (buffer) {
+        console.log('[LocalCache] Restored saved avatar:', savedAvatarName);
+        localAvatarCache = {
+          fileName: savedAvatarName,
+          type: savedAvatarType as 'vrm'|'fbx',
+          buffer: buffer
+        };
+        const blob = new Blob([buffer], { type: 'application/octet-stream' });
+        const blobUrl = URL.createObjectURL(blob);
+        statusDisplay.innerText = `${savedAvatarName} を読み込み中...`;
+        loadingOverlay.classList.remove('hidden');
+        if (savedAvatarType === 'vrm') loadVRM(blobUrl, savedAvatarName);
+        else loadFBX(blobUrl, savedAvatarName);
+      }
+    });
+  }
+
+  const savedWorldName = localStorage.getItem('my_world_filename');
+  const savedWorldType = localStorage.getItem('my_world_type');
+  if (savedWorldName && savedWorldType) {
+    avatarDB.get('my_world').then(buffer => {
+      if (buffer) {
+        console.log('[LocalCache] Restored saved world:', savedWorldName);
+        const blob = new Blob([buffer], { type: 'application/octet-stream' });
+        const blobUrl = URL.createObjectURL(blob);
+        statusDisplay.innerText = `${savedWorldName} を読み込み中...`;
+        loadingOverlay.classList.remove('hidden');
+        if (savedWorldType === 'glb') loadWorldGLTF(blobUrl);
+        else loadWorldFBX(blobUrl);
+      }
+    });
+  }
 }
 
 
@@ -570,6 +614,12 @@ function handleFileUpload(event: Event) {
       type: extension === 'vrm' ? 'vrm' : 'fbx',
       buffer: arrayBuffer
     };
+    
+    // Save to IndexedDB so it's remembered next time
+    avatarDB.set('my_avatar', arrayBuffer).then(() => {
+      localStorage.setItem('my_avatar_filename', file.name);
+      localStorage.setItem('my_avatar_type', extension === 'vrm' ? 'vrm' : 'fbx');
+    });
     
     if (socket && socket.connected) {
       console.log(`[Network] Sharing avatar model: ${file.name} (${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
@@ -1997,11 +2047,19 @@ function handleWorldUpload(event: Event) {
   const reader = new FileReader();
   reader.onload = (e) => {
     const arrayBuffer = e.target?.result as ArrayBuffer;
+    const type = extension === 'glb' || extension === 'gltf' ? 'glb' : 'fbx';
+
+    // Save to IndexedDB so it's remembered next time
+    avatarDB.set('my_world', arrayBuffer).then(() => {
+      localStorage.setItem('my_world_filename', file.name);
+      localStorage.setItem('my_world_type', type);
+    });
+
     if (socket && socket.connected) {
       console.log(`[Network] Sharing world model: ${file.name} (${(arrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB)`);
       socket.emit('world-share', {
         fileName: file.name,
-        type: extension === 'glb' || extension === 'gltf' ? 'glb' : 'fbx',
+        type: type,
         buffer: arrayBuffer
       });
     }
