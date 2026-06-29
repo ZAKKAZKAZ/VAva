@@ -455,13 +455,15 @@ function init() {
   window.addEventListener('touchstart', showMobileControls, { once: true });
 
   let joystickActive = false;
+  let joystickTouchId: number | null = null;
   let startX = 0;
   let startY = 0;
   const maxDragDistance = 45; // Max radius to drag the joystick knob in pixels
 
   if (joystickZone && joystickKnob) {
-    const handleJoystickStart = (clientX: number, clientY: number) => {
+    const handleJoystickStart = (clientX: number, clientY: number, touchId: number | null = null) => {
       joystickActive = true;
+      joystickTouchId = touchId;
       const rect = joystickZone.getBoundingClientRect();
       startX = rect.left + rect.width / 2;
       startY = rect.top + rect.height / 2;
@@ -495,6 +497,7 @@ function init() {
 
     const handleJoystickEnd = () => {
       joystickActive = false;
+      joystickTouchId = null;
       joystickKnob.style.transform = 'translate(0px, 0px)';
       keys.w = false;
       keys.s = false;
@@ -505,17 +508,29 @@ function init() {
     // Touch listeners
     joystickZone.addEventListener('touchstart', (e) => {
       e.preventDefault();
-      const touch = e.touches[0];
-      handleJoystickStart(touch.clientX, touch.clientY);
+      const touch = e.changedTouches[0];
+      handleJoystickStart(touch.clientX, touch.clientY, touch.identifier);
     }, { passive: false });
 
     window.addEventListener('touchmove', (e) => {
       if (!joystickActive) return;
-      const touch = e.touches[0];
-      handleJoystickMove(touch.clientX, touch.clientY);
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].identifier === joystickTouchId) {
+          handleJoystickMove(e.changedTouches[i].clientX, e.changedTouches[i].clientY);
+          break;
+        }
+      }
     }, { passive: false });
 
-    window.addEventListener('touchend', handleJoystickEnd);
+    window.addEventListener('touchend', (e) => {
+      if (!joystickActive) return;
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].identifier === joystickTouchId) {
+          handleJoystickEnd();
+          break;
+        }
+      }
+    });
 
     // Mouse listeners for local testing / hybrid devices
     joystickZone.addEventListener('mousedown', (e) => {
@@ -1644,6 +1659,27 @@ function initNetwork() {
           });
         }
       }
+      // 4. Load skybox background
+      if (environment.skyboxData) {
+        const sd = environment.skyboxData;
+        console.log(`[Network] Loading host skybox: ${sd.fileName}`);
+        const blob = new Blob([sd.buffer], { type: 'image/png' });
+        const url = URL.createObjectURL(blob);
+        
+        const loader = new THREE.TextureLoader();
+        loader.load(url, (texture) => {
+          if (skyboxTexture) skyboxTexture.dispose();
+          skyboxTexture = texture;
+          skyboxTexture.mapping = THREE.EquirectangularReflectionMapping;
+          skyboxTexture.colorSpace = THREE.SRGBColorSpace;
+          scene.background = skyboxTexture;
+          scene.environment = skyboxTexture;
+          URL.revokeObjectURL(url);
+        }, undefined, (err) => {
+          console.error(err);
+          URL.revokeObjectURL(url);
+        });
+      }
     } else {
       // No environment at all, share our cached world if we have one
       const savedWorldName = localStorage.getItem('my_world_filename');
@@ -1673,29 +1709,6 @@ function initNetwork() {
               buffer: buffer
             });
           }
-        });
-      }
-    }
-
-      // 4. Load skybox background
-      if (environment.skyboxData) {
-        const sd = environment.skyboxData;
-        console.log(`[Network] Loading host skybox: ${sd.fileName}`);
-        const blob = new Blob([sd.buffer], { type: 'image/png' });
-        const url = URL.createObjectURL(blob);
-        
-        const loader = new THREE.TextureLoader();
-        loader.load(url, (texture) => {
-          if (skyboxTexture) skyboxTexture.dispose();
-          skyboxTexture = texture;
-          skyboxTexture.mapping = THREE.EquirectangularReflectionMapping;
-          skyboxTexture.colorSpace = THREE.SRGBColorSpace;
-          scene.background = skyboxTexture;
-          scene.environment = skyboxTexture;
-          URL.revokeObjectURL(url);
-        }, undefined, (err) => {
-          console.error(err);
-          URL.revokeObjectURL(url);
         });
       }
     }
