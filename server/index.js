@@ -22,6 +22,7 @@ function getRoom(roomName) {
         worldTransform: null,
         skyboxData: null,
         sunSettings: null,
+        bgmData: null,
       }
     });
   }
@@ -144,6 +145,16 @@ io.on('connection', (socket) => {
       roomObj.environment.worldData = data;
     }
     socket.to(currentRoom).emit('world-shared', data);
+  });
+
+  // BGMの共有と保存
+  socket.on('bgm-share', (data) => {
+    if (!currentRoom) return;
+    const roomObj = rooms.get(currentRoom);
+    if (roomObj) {
+      roomObj.environment.bgmData = data;
+    }
+    socket.to(currentRoom).emit('bgm-shared', data);
   });
 
   // スカイボックス背景画像の共有と保存

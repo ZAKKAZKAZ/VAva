@@ -236,6 +236,18 @@ function init() {
 
   const skyboxFileInput = document.getElementById('skybox-upload') as HTMLInputElement;
   skyboxFileInput.addEventListener('change', handleSkyboxUpload);
+
+  const bgmFileInput = document.getElementById('bgm-upload') as HTMLInputElement;
+  if (bgmFileInput) bgmFileInput.addEventListener('change', handleBgmUpload);
+
+  const bgmVolumeSlider = document.getElementById('bgm-volume') as HTMLInputElement;
+  if (bgmVolumeSlider) {
+    bgmVolumeSlider.addEventListener('input', (e) => {
+      const vol = parseFloat((e.target as HTMLInputElement).value);
+      const bgmPlayer = document.getElementById('bgm-player') as HTMLAudioElement;
+      if (bgmPlayer) bgmPlayer.volume = vol;
+    });
+  }
   
   webcamBtn.addEventListener('click', toggleWebcam);
 
@@ -599,6 +611,18 @@ function init() {
         loadingOverlay.classList.remove('hidden');
         if (savedWorldType === 'glb') loadWorldGLTF(blobUrl);
         else loadWorldFBX(blobUrl);
+      }
+    });
+  }
+
+  // Restore Cached BGM
+  const savedBgmName = localStorage.getItem('my_bgm_filename');
+  const savedBgmType = localStorage.getItem('my_bgm_type');
+  if (savedBgmName && savedBgmType) {
+    avatarDB.get('my_bgm').then(buffer => {
+      if (buffer) {
+        console.log('[LocalCache] Restored saved BGM:', savedBgmName);
+        playBgmFromBuffer(buffer, savedBgmType);
       }
     });
   }
@@ -1583,6 +1607,29 @@ function initNetwork() {
           });
         }
       }
+
+      // 3.5 Load BGM
+      if (environment.bgmData) {
+        const bd = environment.bgmData;
+        console.log(`[Network] Loading host BGM: ${bd.fileName}`);
+        playBgmFromBuffer(bd.buffer, bd.type || 'audio/mpeg');
+      } else {
+        // Room has no BGM, share our cached BGM if we have one
+        const savedBgmName = localStorage.getItem('my_bgm_filename');
+        const savedBgmType = localStorage.getItem('my_bgm_type');
+        if (savedBgmName && savedBgmType) {
+          avatarDB.get('my_bgm').then(buffer => {
+            if (buffer && socket && socket.connected) {
+              console.log(`[Network] Auto-sharing cached BGM: ${savedBgmName}`);
+              socket.emit('bgm-share', {
+                fileName: savedBgmName,
+                type: savedBgmType,
+                buffer: buffer
+              });
+            }
+          });
+        }
+      }
     } else {
       // No environment at all, share our cached world if we have one
       const savedWorldName = localStorage.getItem('my_world_filename');
@@ -1594,6 +1641,21 @@ function initNetwork() {
             socket.emit('world-share', {
               fileName: savedWorldName,
               type: savedWorldType,
+              buffer: buffer
+            });
+          }
+        });
+      }
+
+      const savedBgmName = localStorage.getItem('my_bgm_filename');
+      const savedBgmType = localStorage.getItem('my_bgm_type');
+      if (savedBgmName && savedBgmType) {
+        avatarDB.get('my_bgm').then(buffer => {
+          if (buffer && socket && socket.connected) {
+            console.log(`[Network] Auto-sharing cached BGM: ${savedBgmName}`);
+            socket.emit('bgm-share', {
+              fileName: savedBgmName,
+              type: savedBgmType,
               buffer: buffer
             });
           }
@@ -1738,6 +1800,12 @@ function initNetwork() {
     } else {
       loadWorldFBX(url);
     }
+  });
+
+  // 他のプレイヤーからBGMが共有された場合
+  socket.on('bgm-shared', ({ fileName, type, buffer }: { fileName: string; type: string; buffer: ArrayBuffer }) => {
+    console.log(`[Network] Remote BGM received: ${fileName}`);
+    playBgmFromBuffer(buffer, type || 'audio/mpeg');
   });
 
   // 他のプレイヤーからスカイボックス画像データが共有された場合
@@ -2336,6 +2404,69 @@ function handleSkyboxUpload(event: Event) {
       URL.revokeObjectURL(url);
     }
   );
+}
+
+function handleBgmUpload(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
+  statusDisplay.innerText = `${file.name} (BGM) を読み込み中...`;
+
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const arrayBuffer = e.target?.result as ArrayBuffer;
+    const type = file.type || 'audio/mpeg';
+
+    // Save to IndexedDB
+    avatarDB.set('my_bgm', arrayBuffer).then(() => {
+      localStorage.setItem('my_bgm_filename', file.name);
+      localStorage.setItem('my_bgm_type', type);
+    });
+
+    playBgmFromBuffer(arrayBuffer, type);
+
+    if (socket && socket.connected) {
+      console.log(`[Network] Sharing BGM: ${file.name}`);
+      socket.emit('bgm-share', {
+        fileName: file.name,
+        type: type,
+        buffer: arrayBuffer
+      });
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+let currentBgmUrl: string | null = null;
+function playBgmFromBuffer(buffer: ArrayBuffer, type: string) {
+  const bgmPlayer = document.getElementById('bgm-player') as HTMLAudioElement;
+  if (!bgmPlayer) return;
+
+  if (currentBgmUrl) {
+    URL.revokeObjectURL(currentBgmUrl);
+  }
+
+  const blob = new Blob([buffer], { type: type });
+  currentBgmUrl = URL.createObjectURL(blob);
+
+  bgmPlayer.src = currentBgmUrl;
+  
+  // Browsers might block autoplay without user interaction
+  const playPromise = bgmPlayer.play();
+  if (playPromise !== undefined) {
+    playPromise.catch(error => {
+      console.warn("BGM autoplay prevented. User interaction required.", error);
+      statusDisplay.innerText = "BGM再生のため画面内をクリックしてください";
+      
+      const playOnInteraction = () => {
+        bgmPlayer.play();
+        document.removeEventListener('click', playOnInteraction);
+        statusDisplay.innerText = "準備完了";
+      };
+      document.addEventListener('click', playOnInteraction);
+    });
+  }
 }
 
 // --- Text & Voice Chat Helpers ---
