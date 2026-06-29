@@ -624,7 +624,7 @@ function init() {
         const blobUrl = URL.createObjectURL(blob);
         statusDisplay.innerText = `${savedWorldName} を読み込み中...`;
         loadingOverlay.classList.remove('hidden');
-        if (savedWorldType === 'glb') loadWorldGLTF(blobUrl);
+        if (savedWorldType === 'glb' || savedWorldType === 'gltf') loadWorldGLTF(blobUrl);
         else loadWorldFBX(blobUrl);
       }
     });
@@ -1216,6 +1216,21 @@ function animate() {
       }
     });
 
+    // --- Positional Audio (Distance Attenuation) ---
+    const localModel = currentVrm ? currentVrm.scene : currentFbx ?? null;
+    const localPos = localModel ? localModel.position : camera.position;
+    remotePlayers.forEach((rp, id) => {
+      const audioEl = document.getElementById(`audio-${id}`) as HTMLAudioElement;
+      if (audioEl && rp.group) {
+        const dist = localPos.distanceTo(rp.group.position);
+        const maxDist = 15.0; // Audio fadeout distance in meters
+        let volume = 1.0 - (dist / maxDist);
+        if (volume < 0) volume = 0;
+        if (volume > 1) volume = 1;
+        audioEl.volume = volume;
+      }
+    });
+
     // --- Send local state to server ---
     if (socket && socket.connected) {
       const now = performance.now();
@@ -1614,7 +1629,7 @@ function initNetwork() {
         const url = URL.createObjectURL(blob);
         loadingOverlay.classList.remove('hidden');
         statusDisplay.innerText = `ホストのワールド (${wd.fileName}) をロード中...`;
-        if (wd.type === 'glb') {
+        if (wd.type === 'glb' || wd.type === 'gltf') {
           loadWorldGLTF(url);
         } else {
           loadWorldFBX(url);
@@ -1815,14 +1830,14 @@ function initNetwork() {
   });
 
   // 他のプレイヤーからワールドモデルデータが共有された場合
-  socket.on('world-shared', ({ fileName, type, buffer }: { fileName: string; type: 'glb' | 'fbx'; buffer: ArrayBuffer }) => {
+  socket.on('world-shared', ({ fileName, type, buffer }: { fileName: string; type: string; buffer: ArrayBuffer }) => {
     const blob = new Blob([buffer], { type: 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
     
     loadingOverlay.classList.remove('hidden');
     statusDisplay.innerText = `他プレイヤーのワールド (${fileName}) をロード中...`;
     
-    if (type === 'glb') {
+    if (type === 'glb' || type === 'gltf') {
       loadWorldGLTF(url);
     } else {
       loadWorldFBX(url);
