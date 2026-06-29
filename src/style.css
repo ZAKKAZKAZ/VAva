@@ -518,10 +518,10 @@ input[type="checkbox"] {
 /* --- Text Chat UI --- */
 .chat-container {
   position: absolute;
-  bottom: 30px;
-  left: 30px;
+  top: 30px;
+  right: 30px;
   width: 320px;
-  height: 240px;
+  height: 280px;
   background: rgba(15, 18, 25, 0.5);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -629,9 +629,9 @@ input[type="checkbox"] {
 @media (max-width: 768px) {
   .chat-container {
     width: 280px;
-    height: 160px;
-    bottom: 180px; /* Above the joystick */
-    left: 20px;
+    height: 200px;
+    top: 20px;
+    right: 20px;
   }
 }
 

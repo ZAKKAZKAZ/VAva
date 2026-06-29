@@ -149,7 +149,6 @@
               <input type="text" id="player-name" placeholder="プレイヤー名" class="name-input" maxlength="20" />
             </div>
              <button id="connect-btn" class="action-btn">🌐 サーバー接続</button>
-             <button id="mic-btn" class="action-btn" style="background:rgba(255,108,142,0.1);border-color:rgba(255,108,142,0.25);color:#ff6c8e;display:none;margin-top:0.4rem;">🎤 マイク: OFF</button>
              <button id="qr-btn" class="action-btn" style="background:rgba(108,142,255,0.15);border-color:rgba(108,142,255,0.3);margin-top:0.4rem;">📱 スマホで接続 (QR)</button>
              <p id="network-status" class="status-text" style="color:#ff6c8e;">🔴 未接続</p>
             <p style="font-size:0.65rem;color:#666;margin-top:4px;">同じルーム名の人同士が同じ空間に入れます</p>
@@ -187,6 +186,10 @@
 
       <!-- Text Chat UI (Hidden by default, shown when connected to multiplayer) -->
       <div id="chat-container" class="chat-container" style="display: none;">
+        <div class="chat-header" style="padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.1); display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.2);">
+          <span style="font-size: 0.85rem; color: #ddd; font-weight: 600;">💬 チャット</span>
+          <button id="mic-btn" class="action-btn" style="background:rgba(255,108,142,0.1);border-color:rgba(255,108,142,0.25);color:#ff6c8e;display:none;margin:0;padding:4px 10px;font-size:0.8rem;width:auto;border-radius:4px;">🎤 マイク: OFF</button>
+        </div>
         <div id="chat-messages" class="chat-messages"></div>
         <div class="chat-input-row">
           <input type="text" id="chat-input" placeholder="メッセージを入力..." maxlength="100" />
