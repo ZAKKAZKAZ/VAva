@@ -52,6 +52,7 @@ let isJumping = false;
 // Procedural Animation State
 let walkTime = 0;
 let currentAnimState = 'idle'; // idle, walk, walkBack, strafeLeft, strafeRight, jump
+let currentCameraMode: 'TPS' | 'FPS' = 'TPS';
 
 // --- Multiplayer Network ---
 interface RemotePlayerState {
@@ -75,12 +76,50 @@ interface RemotePlayerObj {
   fbx?: THREE.Group;
   defaultVisuals?: THREE.Group;
   mixer?: THREE.AnimationMixer;
+  avatarKey?: string;
+  isAvatarLoading?: boolean;
 }
 let socket: Socket | null = null;
 const remotePlayers = new Map<string, RemotePlayerObj>();
 let localPlayerName = 'Player_' + Math.floor(Math.random() * 9000 + 1000);
 let localRoomName = 'CHAT';
 let localAvatarCache: { fileName: string; type: 'vrm' | 'fbx'; buffer: ArrayBuffer } | null = null;
+
+// IndexedDB Avatar Cache
+const avatarDB = {
+  db: null as IDBDatabase | null,
+  init() {
+    return new Promise<void>((resolve, reject) => {
+      const req = indexedDB.open('AvatarCacheDB', 1);
+      req.onupgradeneeded = (e: any) => {
+        e.target.result.createObjectStore('avatars');
+      };
+      req.onsuccess = (e: any) => {
+        this.db = e.target.result;
+        resolve();
+      };
+      req.onerror = () => reject();
+    });
+  },
+  async set(key: string, data: ArrayBuffer) {
+    if (!this.db) await this.init();
+    return new Promise<void>((resolve) => {
+      const tx = this.db!.transaction('avatars', 'readwrite');
+      tx.objectStore('avatars').put(data, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  },
+  async get(key: string): Promise<ArrayBuffer | null> {
+    if (!this.db) await this.init();
+    return new Promise((resolve) => {
+      const tx = this.db!.transaction('avatars', 'readonly');
+      const req = tx.objectStore('avatars').get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+  }
+};
 
 // WebRTC & Chat Globals
 interface PeerConnectionInfo {
@@ -187,6 +226,26 @@ function init() {
   skyboxFileInput.addEventListener('change', handleSkyboxUpload);
   
   webcamBtn.addEventListener('click', toggleWebcam);
+
+  // Camera Mode UI
+  const cameraModeBtn = document.getElementById('camera-mode-btn') as HTMLButtonElement;
+  if (cameraModeBtn) {
+    cameraModeBtn.addEventListener('click', () => {
+      const activeModel = currentVrm ? currentVrm.scene : currentFbx ?? null;
+      if (currentCameraMode === 'TPS') {
+        currentCameraMode = 'FPS';
+        cameraModeBtn.innerHTML = '<span>🎥 カメラ視点: FPS (1人称)</span>';
+      } else {
+        currentCameraMode = 'TPS';
+        cameraModeBtn.innerHTML = '<span>🎥 カメラ視点: TPS (3人称)</span>';
+        if (activeModel) {
+          // Reset camera distance for TPS
+          const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(activeModel.quaternion);
+          camera.position.copy(activeModel.position).add(new THREE.Vector3(0, 1.5, 0)).add(forward.multiplyScalar(2.5));
+        }
+      }
+    });
+  }
 
   // Network UI
   const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement;
@@ -935,10 +994,45 @@ function animate() {
     let modelObj = currentVrm ? currentVrm.scene : (currentFbx ? currentFbx : null);
     if (modelObj) {
       const moveSpeed = 2.0 * delta;
-      if (keys.w) modelObj.position.z -= moveSpeed;
-      if (keys.s) modelObj.position.z += moveSpeed;
-      if (keys.a) modelObj.position.x -= moveSpeed;
-      if (keys.d) modelObj.position.x += moveSpeed;
+      
+      // Calculate camera-relative movement
+      const camForward = new THREE.Vector3();
+      camera.getWorldDirection(camForward);
+      camForward.y = 0;
+      if (camForward.lengthSq() > 0.001) {
+         camForward.normalize();
+      } else {
+         camForward.set(0, 0, -1);
+      }
+      
+      const camRight = new THREE.Vector3().crossVectors(camForward, new THREE.Vector3(0, 1, 0)).normalize();
+
+      const moveDir = new THREE.Vector3();
+      if (keys.w) moveDir.add(camForward);
+      if (keys.s) moveDir.sub(camForward);
+      if (keys.a) moveDir.sub(camRight);
+      if (keys.d) moveDir.add(camRight);
+
+      if (moveDir.lengthSq() > 0) {
+        moveDir.normalize();
+        modelObj.position.add(moveDir.clone().multiplyScalar(moveSpeed));
+        
+        // Align avatar rotation
+        const alignDir = currentCameraMode === 'FPS' ? camForward : moveDir;
+        const targetAngle = Math.atan2(alignDir.x, alignDir.z);
+        
+        let diff = targetAngle - modelObj.rotation.y;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        modelObj.rotation.y += diff * 10 * delta;
+      } else if (currentCameraMode === 'FPS') {
+        // In FPS mode, align body to camera even when not moving
+        const targetAngle = Math.atan2(camForward.x, camForward.z);
+        let diff = targetAngle - modelObj.rotation.y;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        modelObj.rotation.y += diff * 10 * delta;
+      }
 
       // Handle Jump Physics
       if (isJumping) {
@@ -1035,6 +1129,37 @@ function animate() {
           rotationY: rotY,
           boneRots:  { ...boneRotations },
         } satisfies RemotePlayerState);
+      }
+    }
+
+    // --- Camera Tracking Mode (TPS/FPS) ---
+    const activeModel = currentVrm ? currentVrm.scene : currentFbx ?? null;
+    if (activeModel) {
+      let headPos = new THREE.Vector3();
+      let headHeight = 1.4;
+      if (currentVrm && currentVrm.humanoid) {
+        const headBone = currentVrm.humanoid.getNormalizedBoneNode('head');
+        if (headBone) {
+          headPos.setFromMatrixPosition(headBone.matrixWorld);
+          // Add a tiny forward offset so we don't clip into the face mesh
+          const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(activeModel.quaternion);
+          headPos.add(forward.multiplyScalar(0.12));
+          headHeight = headPos.y - activeModel.position.y;
+        }
+      } else {
+        headPos.copy(activeModel.position).add(new THREE.Vector3(0, headHeight, 0.12));
+      }
+
+      if (currentCameraMode === 'TPS') {
+        // Smoothly follow the character's upper body in TPS
+        const targetPos = activeModel.position.clone().add(new THREE.Vector3(0, headHeight * 0.7, 0));
+        controls.target.lerp(targetPos, 0.15);
+      } else if (currentCameraMode === 'FPS') {
+        // Lock camera to head, target slightly in front for look-around
+        const lookDir = new THREE.Vector3();
+        camera.getWorldDirection(lookDir);
+        camera.position.copy(headPos);
+        controls.target.copy(headPos).add(lookDir.multiplyScalar(0.1));
       }
     }
 
@@ -1143,6 +1268,13 @@ function createRemotePlayerMesh(id: string, name: string): RemotePlayerObj {
 }
 
 function setupRemotePlayerAvatar(rp: RemotePlayerObj, avatarData: NonNullable<RemotePlayerState['avatarData']>) {
+  const newKey = `${avatarData.fileName}_${avatarData.buffer.byteLength}`;
+  if (rp.avatarKey === newKey) {
+    return; // Already loaded or loading this exact avatar
+  }
+  rp.avatarKey = newKey;
+  rp.isAvatarLoading = true;
+
   if (rp.vrm) {
     rp.group.remove(rp.vrm.scene);
     rp.vrm = undefined;
@@ -1180,9 +1312,11 @@ function setupRemotePlayerAvatar(rp: RemotePlayerObj, avatarData: NonNullable<Re
       const headPos = head ? head.position.y : 1.5;
       rp.nameSprite.position.y = headPos + 0.45;
 
+      rp.isAvatarLoading = false;
       URL.revokeObjectURL(blobUrl);
     }, undefined, (err) => {
       console.error("[Network] Failed to load remote VRM", err);
+      rp.isAvatarLoading = false;
       URL.revokeObjectURL(blobUrl);
     });
   } else if (avatarData.type === 'fbx') {
@@ -1208,9 +1342,11 @@ function setupRemotePlayerAvatar(rp: RemotePlayerObj, avatarData: NonNullable<Re
       }
 
       rp.nameSprite.position.y = 1.95;
+      rp.isAvatarLoading = false;
       URL.revokeObjectURL(blobUrl);
     }, undefined, (err) => {
       console.error("[Network] Failed to load remote FBX", err);
+      rp.isAvatarLoading = false;
       URL.revokeObjectURL(blobUrl);
     });
   }
@@ -1228,11 +1364,6 @@ function applyRemotePlayerState(rp: RemotePlayerObj, state: RemotePlayerState) {
         bone.rotation.set(rot.x, rot.y, rot.z);
       }
     }
-  }
-
-  // If this state contains avatar data and we haven't loaded it yet
-  if (state.avatarData && !rp.vrm && !rp.fbx) {
-    setupRemotePlayerAvatar(rp, state.avatarData);
   }
 }
 
@@ -1320,16 +1451,33 @@ function initNetwork() {
     if (worldScale) { worldScale.value = data.s.toString(); valWorldScale.textContent = data.s.toFixed(2); }
   }
 
-  socket.on('room-joined', ({ room, playerCount, environment }: { room: string; playerCount: number; environment?: any }) => {
+  socket.on('room-joined', ({ room, playerCount, environment, chatHistory }: { room: string; playerCount: number; environment?: any; chatHistory?: { id: string, name: string, text: string }[] }) => {
     updateNetworkStatus(true, room, playerCount);
     console.log(`[Network] Joined room: ${room} (${playerCount} players)`);
 
     // Show chat area and mic button
     const chatContainer = document.getElementById('chat-container');
     const micBtn = document.getElementById('mic-btn');
+    const chatMessages = document.getElementById('chat-messages');
+
     if (chatContainer) chatContainer.style.display = 'flex';
     if (micBtn) micBtn.style.display = 'block';
+
+    // 入室時にチャット履歴をクリア
+    if (chatMessages) {
+      chatMessages.innerHTML = '';
+    }
+
     appendChatMessage('システム', `🟢 ルーム [${room}] に接続しました。`, true);
+
+    // 過去のチャット履歴（掲示板）を表示
+    if (chatHistory && chatHistory.length > 0) {
+      appendChatMessage('システム', '--- 過去のメッセージ ---', true);
+      chatHistory.forEach(msg => {
+        appendChatMessage(msg.name, msg.text);
+      });
+      appendChatMessage('システム', '------------------------', true);
+    }
 
     // Apply environment if it exists (meaning a host has already loaded something)
     if (environment) {
@@ -1398,12 +1546,16 @@ function initNetwork() {
   });
  
   // 既存プレイヤー一覧を受信
-  socket.on('init', (players: Array<{ id: string } & RemotePlayerState>) => {
-    players.forEach(({ id, ...state }) => {
+  socket.on('init', (players: Array<{ id: string, avatarInfo?: any } & RemotePlayerState>) => {
+    players.forEach(({ id, avatarInfo, ...state }) => {
       if (!remotePlayers.has(id)) {
         remotePlayers.set(id, createRemotePlayerMesh(id, state.name));
       }
       applyRemotePlayerState(remotePlayers.get(id)!, state);
+
+      if (avatarInfo) {
+        handleAvatarInfo(id, avatarInfo);
+      }
 
       // Establish WebRTC connection with existing players
       initiateWebRTCPeer(id);
@@ -1436,15 +1588,42 @@ function initNetwork() {
     removeRemotePlayer(id);
   });
 
-  // 他プレイヤーからアバターデータが共有された場合
-  socket.on('avatar-shared', ({ id, fileName, type, buffer }: { id: string } & NonNullable<RemotePlayerState['avatarData']>) => {
+  // 他プレイヤーからアバター情報が共有された場合
+  socket.on('avatar-info', ({ id, fileName, type, size }: { id: string, fileName: string, type: 'vrm'|'fbx', size: number }) => {
     let rp = remotePlayers.get(id);
     if (!rp) {
       rp = createRemotePlayerMesh(id, id.substring(0, 8));
       remotePlayers.set(id, rp);
     }
-    setupRemotePlayerAvatar(rp, { fileName, type, buffer });
+    handleAvatarInfo(id, { fileName, type, size });
   });
+
+  socket.on('avatar-buffer-response', async (data: { id: string, fileName: string, type: 'vrm'|'fbx', buffer: ArrayBuffer }) => {
+    const cacheKey = `${data.fileName}_${data.buffer.byteLength}`;
+    await avatarDB.set(cacheKey, data.buffer);
+    let rp = remotePlayers.get(data.id);
+    if (rp) {
+      setupRemotePlayerAvatar(rp, data);
+    }
+  });
+
+  async function handleAvatarInfo(id: string, info: { fileName: string, type: 'vrm'|'fbx', size: number }) {
+    const cacheKey = `${info.fileName}_${info.size}`;
+    const rp = remotePlayers.get(id);
+    if (!rp) return;
+    
+    // Check if we are already loading this avatar
+    if (rp.avatarKey === cacheKey && rp.isAvatarLoading) return;
+    
+    const cachedBuffer = await avatarDB.get(cacheKey);
+    if (cachedBuffer) {
+      console.log(`[Network] Found cached avatar for ${id}: ${info.fileName}`);
+      setupRemotePlayerAvatar(rp, { fileName: info.fileName, type: info.type, buffer: cachedBuffer });
+    } else {
+      console.log(`[Network] Requesting avatar buffer for ${id}: ${info.fileName}`);
+      socket?.emit('request-avatar-buffer', id);
+    }
+  }
 
   // 他のプレイヤーがワールド調整（位置、回転、スケール）を操作した際に受け取る
   socket.on('world-transformed', (data: { x: number, y: number, z: number, rY: number, s: number }) => {

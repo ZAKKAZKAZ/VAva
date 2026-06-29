@@ -55,9 +55,16 @@ io.on('connection', (socket) => {
     socket.join(currentRoom);
     const roomPlayers = getRoom(currentRoom);
 
-    // 既存メンバー一覧を新規参加者に送る
+    // 既存メンバー一覧を新規参加者に送る (Bufferは除外してメタデータのみ送る)
     const existing = [];
-    roomPlayers.forEach((state, pid) => existing.push({ id: pid, ...state }));
+    roomPlayers.forEach((state, pid) => {
+      const { avatarData, ...rest } = state;
+      let info = { id: pid, ...rest };
+      if (avatarData) {
+        info.avatarInfo = { fileName: avatarData.fileName, type: avatarData.type, size: avatarData.buffer.byteLength };
+      }
+      existing.push(info);
+    });
     socket.emit('init', existing);
 
     // 初期状態を登録
@@ -73,7 +80,8 @@ io.on('connection', (socket) => {
     socket.emit('room-joined', { 
       room: currentRoom, 
       playerCount: roomPlayers.size,
-      environment: roomObj ? roomObj.environment : null
+      environment: roomObj ? roomObj.environment : null,
+      chatHistory: roomObj && roomObj.chatHistory ? roomObj.chatHistory : []
     });
   });
 
@@ -85,7 +93,27 @@ io.on('connection', (socket) => {
     if (player) {
       player.avatarData = data;
     }
-    socket.to(currentRoom).emit('avatar-shared', { id, ...data });
+    socket.to(currentRoom).emit('avatar-info', { 
+      id, 
+      fileName: data.fileName, 
+      type: data.type, 
+      size: data.buffer.byteLength 
+    });
+  });
+
+  // クライアントからのアバター本体要求に応答する
+  socket.on('request-avatar-buffer', (targetId) => {
+    if (!currentRoom) return;
+    const roomPlayers = getRoom(currentRoom);
+    const targetPlayer = roomPlayers.get(targetId);
+    if (targetPlayer && targetPlayer.avatarData) {
+      socket.emit('avatar-buffer-response', {
+        id: targetId,
+        fileName: targetPlayer.avatarData.fileName,
+        type: targetPlayer.avatarData.type,
+        buffer: targetPlayer.avatarData.buffer
+      });
+    }
   });
 
   // ワールドの位置調整（位置、回転、スケール）をルーム内の他の人に転送し、ルーム状態に保存する
@@ -133,6 +161,18 @@ io.on('connection', (socket) => {
     const roomPlayers = getRoom(currentRoom);
     const player = roomPlayers.get(id);
     const name = player ? player.name : id.substring(0, 8);
+    
+    // 掲示板用に履歴を保存
+    const roomObj = rooms.get(currentRoom);
+    if (roomObj) {
+      if (!roomObj.chatHistory) roomObj.chatHistory = [];
+      roomObj.chatHistory.push({ id, name, text });
+      // 最大50件まで保持
+      if (roomObj.chatHistory.length > 50) {
+        roomObj.chatHistory.shift();
+      }
+    }
+
     socket.to(currentRoom).emit('chat-msg', { id, name, text });
   });
 
